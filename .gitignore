@@ -1,23 +1,50 @@
-# Secrets
+# Secrets and local environment
 .env
+.env.*
+!.env.example
 
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-
-# Virtual environment
+# Python virtual environments
 .venv/
 venv/
+env/
 
-# IDE
-.vscode/
-.idea/
+# Python cache / build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
 
-# Runtime data
-data
+# Local project data
+data/project.db
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+data/raw/*.json
+data/raw/*.txt
+data/raw/*.csv
 
-# OS
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+
+# OS files
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# IDE local state
+.vscode/settings.json
+.vscode/tasks.json
+.idea/
+
+# Keep VS Code launch configuration in Git
+!.vscode/launch.json

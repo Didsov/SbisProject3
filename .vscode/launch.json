@@ -1,0 +1,52 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "SBIS: загрузить выборку",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.client_loader",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--selection",
+                "${input:selectionId}"
+            ]
+        },
+        {
+            "name": "SBIS: выборка + 10 карточек",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.client_loader",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--selection",
+                "${input:selectionId}",
+                "--enrich-limit",
+                "10"
+            ]
+        },
+        {
+            "name": "SBIS: выборка + все карточки",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.client_loader",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--selection",
+                "${input:selectionId}",
+                "--enrich-all"
+            ]
+        }
+    ],
+    "inputs": [
+        {
+            "id": "selectionId",
+            "type": "promptString",
+            "description": "Номер выборки СБИС",
+            "default": "41307"
+        }
+    ]
+}
