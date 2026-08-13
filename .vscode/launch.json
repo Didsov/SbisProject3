@@ -39,6 +39,69 @@
                 "${input:selectionId}",
                 "--enrich-all"
             ]
+        },
+
+        {
+            "name": "SQL: показать все запросы",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.sql_export",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--list"
+            ]
+        },
+        {
+            "name": "SQL: экспорт по имени",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.sql_export",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--query",
+                "${input:sqlQueryName}"
+            ]
+        },
+
+        {
+            "name": "SQL ⭐ Все клиенты всех выборок",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.sql_export",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--query",
+                "all_full_clients"
+            ]
+        },
+        {
+            "name": "SQL ⭐ Все клиенты конкретной выборки",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.sql_export",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--query",
+                "selection_full_clients",
+                "--param",
+                "selection_id=${input:selectionId}"
+            ]
+        },
+        {
+            "name": "SQL ⭐ Сводка по выборкам",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.sql_export",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--query",
+                "selections_summary"
+            ]
         }
     ],
     "inputs": [
@@ -47,6 +110,12 @@
             "type": "promptString",
             "description": "Номер выборки СБИС",
             "default": "41307"
+        },
+        {
+            "id": "sqlQueryName",
+            "type": "promptString",
+            "description": "Имя SQL-запроса без .sql",
+            "default": "all_full_clients"
         }
     ]
 }

@@ -22,6 +22,7 @@ dist/
 *.egg-info/
 
 # Local project data
+data
 data/project.db
 data/*.db
 data/*.sqlite
@@ -48,3 +49,5 @@ desktop.ini
 
 # Keep VS Code launch configuration in Git
 !.vscode/launch.json
+
+.exports

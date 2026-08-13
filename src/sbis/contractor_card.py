@@ -146,11 +146,6 @@ async def get_contractor_card(
             ) as response:
                 response_text = await response.text()
 
-                print(
-                    "ContractorCard.Read: "
-                    f"HTTP {response.status}"
-                )
-
                 if response.status == 429:
                     print(
                         "Достигнут лимит ContractorCard.Read."
