@@ -30,7 +30,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATABASE_DIR = PROJECT_ROOT / "data"
 DATABASE_FILE = DATABASE_DIR / "project.db"
-
+MAX_MAIL_SEND_ATTEMPTS = 3
 
 def get_connection() -> sqlite3.Connection:
     """
@@ -137,16 +137,17 @@ def initialize_client_contacts_table(
         ON client_contacts (contact_type)
         """
     )
+
 def initialize_database() -> None:
     """
     Инициализировать структуру основной SQLite-базы проекта.
 
     Что делает:
     - создаёт таблицу clients;
-    - создаёт необходимые индексы clients;
     - добавляет отсутствующие колонки clients;
-    - создаёт таблицу client_contacts;
-    - создаёт индексы client_contacts.
+    - выполняет миграцию идентификаторов клиентов;
+    - создаёт необходимые индексы clients;
+    - создаёт таблицы контактов, выборок и рассылок.
 
     Все операции инициализации выполняются через одно
     соединение с базой данных.
@@ -156,20 +157,21 @@ def initialize_database() -> None:
             """
             CREATE TABLE IF NOT EXISTS clients (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                spp_uuid TEXT NOT NULL UNIQUE,
+
+                spp_uuid TEXT UNIQUE,
+                contractor_id INTEGER UNIQUE,
+
                 inn TEXT,
                 name TEXT,
-                enriched INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
 
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_clients_inn
-            ON clients (inn)
+                enriched INTEGER NOT NULL DEFAULT 0,
+
+                created_at TEXT NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP,
+
+                updated_at TEXT NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP
+            )
             """
         )
 
@@ -179,8 +181,10 @@ def initialize_database() -> None:
                 "PRAGMA table_info(clients)"
             ).fetchall()
         }
+        
 
         columns_to_add = {
+            "contractor_id": "INTEGER",
             "kpp": "TEXT",
             "ogrn": "TEXT",
             "director_last_name": "TEXT",
@@ -201,16 +205,45 @@ def initialize_database() -> None:
                 """
             )
 
+        migrate_clients_identifiers(
+            connection
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_clients_inn
+            ON clients (inn)
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+                idx_clients_contractor_id
+            ON clients (contractor_id)
+            WHERE contractor_id IS NOT NULL
+            """
+        )
+
         initialize_client_contacts_table(
             connection
         )
+
         initialize_client_selections_table(
             connection
         )
 
+        initialize_mailing_tables(
+            connection
+        )
+
+
+
 
 def save_enriched_client(
     client: dict[str, object],
+    *,
+    contractor_id: int | None = None,
 ) -> None:
     """
     Сохранить результат ContractorCard.Read для одного клиента.
@@ -242,10 +275,24 @@ def save_enriched_client(
     """
     spp_uuid = client.get("spp_uuid")
 
-    if not isinstance(spp_uuid, str) or not spp_uuid:
-        raise ValueError(
-            "Обогащённая карточка не содержит корректный spp_uuid"
+    if not isinstance(spp_uuid, str) or not spp_uuid.strip():
+        spp_uuid = None
+    else:
+        spp_uuid = spp_uuid.strip()
+
+    if contractor_id is not None and not isinstance(
+        contractor_id,
+        int,
+    ):
+        raise TypeError(
+            "contractor_id должен быть int или None"
         )
+    if spp_uuid is None and contractor_id is None:
+        raise ValueError(
+            "Невозможно сохранить карточку: "
+            "нет spp_uuid и contractor_id"
+        )
+
 
     director = client.get("director")
 
@@ -271,25 +318,36 @@ def save_enriched_client(
     with get_connection() as connection:
         row = connection.execute(
             """
-            SELECT id
+            SELECT id,   spp_uuid, contractor_id
             FROM clients
-            WHERE spp_uuid = ?
+            WHERE 
+                (? IS NOT NULL AND contractor_id = ?)
+                OR
+                (? IS NOT NULL AND spp_uuid = ?)
+            LIMIT 1
             """,
-            (spp_uuid,),
+            (
+                contractor_id,
+                contractor_id,
+                spp_uuid,
+                spp_uuid,
+            ),
         ).fetchone()
 
         if row is None:
             raise ValueError(
-                "Клиент с SppUuid "
-                f"{spp_uuid} отсутствует в базе"
+                "Клиент отсутствует в базе. "
+                f"spp_uuid={spp_uuid!r}, "
+                f"contractor_id={contractor_id!r}"
             )
-
+        
         client_id = row["id"]
 
         connection.execute(
             """
             UPDATE clients
             SET
+                spp_uuid = COALESCE(?, spp_uuid),
                 name = COALESCE(?, name),
                 inn = COALESCE(?, inn),
                 kpp = ?,
@@ -304,6 +362,7 @@ def save_enriched_client(
             WHERE id = ?
             """,
             (
+                spp_uuid,
                 client.get("name"),
                 client.get("inn"),
                 client.get("kpp"),
@@ -400,6 +459,7 @@ def get_unenriched_clients(
 
         {
             "spp_uuid": ...,
+            "contractor_id": ...,
             "inn": ...,
             "name": ...
         }
@@ -425,6 +485,7 @@ def get_unenriched_clients(
         query = """
             SELECT
                 c.spp_uuid,
+                c.contractor_id,
                 c.inn,
                 c.name
             FROM clients AS c
@@ -435,6 +496,7 @@ def get_unenriched_clients(
         query = """
             SELECT
                 c.spp_uuid,
+                c.contractor_id,
                 c.inn,
                 c.name
             FROM clients AS c
@@ -503,7 +565,19 @@ def upsert_clients(
         for client in clients:
             spp_uuid = client.get("SppUuid")
 
-            if not isinstance(spp_uuid, str) or not spp_uuid:
+            if not isinstance(spp_uuid, str) or not spp_uuid.strip():
+                spp_uuid = None
+            else:
+                spp_uuid = spp_uuid.strip()
+            contractor_id = client.get("@Лицо")
+
+            if not isinstance(contractor_id, int):
+                contractor_id = client.get("ID")
+
+            if not isinstance(contractor_id, int):
+                contractor_id = None
+
+            if spp_uuid is None and contractor_id is None:
                 continue
 
             inn = client.get("ИНН")
@@ -513,18 +587,28 @@ def upsert_clients(
                 """
                 INSERT INTO clients (
                     spp_uuid,
+                    contractor_id,
                     inn,
                     name
                 )
-                VALUES (?, ?, ?)
+                VALUES (?, ?, ?, ?)
 
-                ON CONFLICT(spp_uuid) DO UPDATE SET
+                ON CONFLICT DO UPDATE SET
+                    spp_uuid = COALESCE(
+                        excluded.spp_uuid,
+                        clients.spp_uuid
+                    ),
+                    contractor_id = COALESCE(
+                        excluded.contractor_id,
+                        clients.contractor_id
+                    ),
                     inn = excluded.inn,
                     name = excluded.name,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
                     spp_uuid,
+                    contractor_id,
                     inn if isinstance(inn, str) else None,
                     name if isinstance(name, str) else None,
                 ),
@@ -534,9 +618,18 @@ def upsert_clients(
                 """
                 SELECT id
                 FROM clients
-                WHERE spp_uuid = ?
+                WHERE
+                    (? IS NOT NULL AND spp_uuid = ?)
+                    OR
+                    (? IS NOT NULL AND contractor_id = ?)
+                LIMIT 1
                 """,
-                (spp_uuid,),
+                (
+                    spp_uuid,
+                    spp_uuid,
+                    contractor_id,
+                    contractor_id,
+                ),
             ).fetchone()
 
             if row is None:
@@ -637,4 +730,1236 @@ def initialize_client_selections_table(
         CREATE INDEX IF NOT EXISTS idx_client_selections_client_id
         ON client_selections (client_id)
         """
+    )
+
+
+
+def initialize_mailing_tables(
+    connection: sqlite3.Connection,
+) -> None:
+    """
+    Создать таблицы подсистемы почтовых рассылок.
+
+    Таблицы:
+    - mail_campaigns:
+        Описывает кампанию рассылки и связывает её
+        с выборкой клиентов СБИС.
+
+    - mail_recipients:
+        Хранит конкретных получателей кампании.
+        Один клиент может иметь несколько email,
+        поэтому получатель определяется сочетанием
+        campaign_id + client_id + email.
+
+    - mail_messages:
+        Хранит факт попытки отправки письма
+        конкретному получателю и идентификатор
+        сообщения почтового провайдера.
+
+    - mail_events:
+        Хранит историю событий письма:
+        delivered, opened, clicked, bounced и другие.
+
+    Аргументы:
+        connection:
+            Открытое SQLite-соединение, в котором
+            необходимо создать таблицы и индексы.
+
+    Возвращает:
+        None.
+    """
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mail_campaigns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            name TEXT NOT NULL UNIQUE,
+            template_name TEXT,
+
+            selection_id INTEGER NOT NULL,
+
+            status TEXT NOT NULL DEFAULT 'draft',
+
+            created_at TEXT NOT NULL
+                DEFAULT CURRENT_TIMESTAMP,
+
+            updated_at TEXT NOT NULL
+                DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    campaign_columns = {
+        row["name"]
+        for row in connection.execute(
+            "PRAGMA table_info(mail_campaigns)"
+        ).fetchall()
+    }
+
+    if "template_name" not in campaign_columns:
+        connection.execute(
+            """
+            ALTER TABLE mail_campaigns
+            ADD COLUMN template_name TEXT
+            """
+        )
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mail_recipients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            campaign_id INTEGER NOT NULL,
+
+            client_id INTEGER NOT NULL,
+
+            email TEXT NOT NULL,
+
+            status TEXT NOT NULL DEFAULT 'pending',
+
+            created_at TEXT NOT NULL
+                DEFAULT CURRENT_TIMESTAMP,
+
+            updated_at TEXT NOT NULL
+                DEFAULT CURRENT_TIMESTAMP,
+
+            FOREIGN KEY (campaign_id)
+                REFERENCES mail_campaigns(id)
+                ON DELETE CASCADE,
+
+            FOREIGN KEY (client_id)
+                REFERENCES clients(id)
+                ON DELETE CASCADE,
+
+            UNIQUE (
+                campaign_id,
+                client_id,
+                email
+            )
+        )
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mail_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            recipient_id INTEGER NOT NULL,
+
+            provider TEXT,
+
+            provider_message_id TEXT,
+
+            status TEXT NOT NULL DEFAULT 'pending',
+
+            sent_at TEXT,
+
+            created_at TEXT NOT NULL
+                DEFAULT CURRENT_TIMESTAMP,
+
+            updated_at TEXT NOT NULL
+                DEFAULT CURRENT_TIMESTAMP,
+
+            FOREIGN KEY (recipient_id)
+                REFERENCES mail_recipients(id)
+                ON DELETE CASCADE
+        )
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mail_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            message_id INTEGER NOT NULL,
+
+            event_type TEXT NOT NULL,
+
+            event_at TEXT NOT NULL
+                DEFAULT CURRENT_TIMESTAMP,
+
+            event_data TEXT,
+
+            created_at TEXT NOT NULL
+                DEFAULT CURRENT_TIMESTAMP,
+
+            FOREIGN KEY (message_id)
+                REFERENCES mail_messages(id)
+                ON DELETE CASCADE
+        )
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_mail_campaigns_selection_id
+        ON mail_campaigns(selection_id)
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_mail_recipients_campaign_id
+        ON mail_recipients(campaign_id)
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_mail_recipients_client_id
+        ON mail_recipients(client_id)
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_mail_recipients_email
+        ON mail_recipients(email)
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_mail_recipients_status
+        ON mail_recipients(status)
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_mail_messages_recipient_id
+        ON mail_messages(recipient_id)
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_mail_messages_provider_message_id
+        ON mail_messages(provider_message_id)
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_mail_messages_status
+        ON mail_messages(status)
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_mail_events_message_id
+        ON mail_events(message_id)
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_mail_events_event_type
+        ON mail_events(event_type)
+        """
+    )
+
+
+def get_or_create_mail_campaign(
+    *,
+    name: str,
+    selection_id: int,
+) -> int:
+    """
+    Получить существующую почтовую кампанию
+    или создать новую.
+
+    Что делает:
+    - ищет кампанию по уникальному имени;
+    - если кампания уже существует, возвращает её id;
+    - если кампании нет, создаёт её;
+    - сохраняет selection_id, к которой относится кампания.
+
+    Аргументы:
+        name:
+            Уникальное имя кампании.
+
+        selection_id:
+            Номер выборки СБИС, которая является
+            источником клиентов для кампании.
+
+    Возвращает:
+        ID кампании из таблицы mail_campaigns.
+
+    Исключения:
+        ValueError:
+            Если name пустое;
+            если selection_id меньше 1.
+
+        RuntimeError:
+            Если после создания не удалось получить id кампании.
+    """
+    campaign_name = name.strip()
+
+    if not campaign_name:
+        raise ValueError(
+            "Имя кампании не может быть пустым"
+        )
+
+    if selection_id < 1:
+        raise ValueError(
+            "selection_id должен быть больше 0"
+        )
+
+    with get_connection() as connection:
+        existing = connection.execute(
+            """
+            SELECT
+                id,
+                selection_id
+            FROM mail_campaigns
+            WHERE name = ?
+            """,
+            (campaign_name,),
+        ).fetchone()
+
+        if existing is not None:
+            existing_selection_id = existing[
+                "selection_id"
+            ]
+
+            if existing_selection_id != selection_id:
+                raise ValueError(
+                    f"Кампания {campaign_name!r} уже существует "
+                    f"для выборки #{existing_selection_id}, "
+                    f"а передана выборка #{selection_id}"
+                )
+
+            return existing["id"]
+
+        connection.execute(
+            """
+            INSERT INTO mail_campaigns (
+                name,
+                selection_id
+            )
+            VALUES (?, ?)
+            """,
+            (
+                campaign_name,
+                selection_id,
+            ),
+        )
+
+        row = connection.execute(
+            """
+            SELECT id
+            FROM mail_campaigns
+            WHERE name = ?
+            """,
+            (campaign_name,),
+        ).fetchone()
+
+        if row is None:
+            raise RuntimeError(
+                "Не удалось получить id созданной кампании"
+            )
+
+        return row["id"]
+
+
+def populate_mail_recipients(
+    campaign_id: int,
+) -> int:
+    """
+    Наполнить получателей почтовой кампании из связанной выборки СБИС.
+
+    Что делает:
+    - находит кампанию по campaign_id;
+    - получает selection_id этой кампании;
+    - выбирает клиентов, входящих в эту выборку;
+    - берёт только контакты типа email;
+    - добавляет каждого получателя в mail_recipients;
+    - не создаёт дубли благодаря UNIQUE(
+        campaign_id,
+        client_id,
+        email
+      );
+    - возвращает количество новых добавленных получателей.
+
+    Аргументы:
+        campaign_id:
+            ID кампании из таблицы mail_campaigns.
+
+    Возвращает:
+        Количество новых строк, добавленных
+        в таблицу mail_recipients.
+
+    Исключения:
+        ValueError:
+            Если campaign_id меньше 1.
+
+        LookupError:
+            Если кампания с таким ID не найдена.
+    """
+    if campaign_id < 1:
+        raise ValueError(
+            "campaign_id должен быть больше 0"
+        )
+
+    with get_connection() as connection:
+        campaign = connection.execute(
+            """
+            SELECT
+                id,
+                selection_id
+            FROM mail_campaigns
+            WHERE id = ?
+            """,
+            (campaign_id,),
+        ).fetchone()
+
+        if campaign is None:
+            raise LookupError(
+                f"Кампания с id={campaign_id} не найдена"
+            )
+
+        selection_id = campaign["selection_id"]
+
+        cursor = connection.execute(
+            """
+            INSERT OR IGNORE INTO mail_recipients (
+                campaign_id,
+                client_id,
+                email
+            )
+            SELECT
+                ?,
+                c.id,
+                cc.value
+            FROM clients AS c
+
+            INNER JOIN client_selections AS cs
+                ON cs.client_id = c.id
+
+            INNER JOIN client_contacts AS cc
+                ON cc.client_id = c.id
+
+            WHERE
+                cs.selection_id = ?
+                AND cc.contact_type = 'email'
+                AND cc.value IS NOT NULL
+                AND TRIM(cc.value) <> ''
+            """,
+            (
+                campaign_id,
+                selection_id,
+            ),
+        )
+
+        return cursor.rowcount
+
+
+
+
+def migrate_clients_identifiers(
+    connection: sqlite3.Connection,
+) -> None:
+    """
+    Мигрировать таблицу clients на поддержку двух типов идентификаторов.
+
+    После миграции клиент может иметь:
+    - spp_uuid;
+    - contractor_id;
+    - либо оба идентификатора одновременно.
+
+    Что делает:
+    - проверяет текущую схему clients;
+    - если spp_uuid уже допускает NULL, ничего не меняет;
+    - создаёт временную таблицу clients_new;
+    - переносит все существующие данные с сохранением id;
+    - удаляет старую таблицу clients;
+    - переименовывает clients_new в clients.
+
+    Аргументы:
+        connection:
+            Открытое SQLite-соединение.
+
+    Возвращает:
+        None.
+    """
+    columns = {
+        row["name"]: row
+        for row in connection.execute(
+            "PRAGMA table_info(clients)"
+        ).fetchall()
+    }
+
+    spp_uuid_column = columns.get(
+        "spp_uuid"
+    )
+
+    if spp_uuid_column is None:
+        raise RuntimeError(
+            "В таблице clients отсутствует spp_uuid"
+        )
+
+    # notnull == 0 означает, что колонка уже допускает NULL.
+    if (
+        spp_uuid_column["notnull"] == 0
+        and "contractor_id" in columns
+    ):
+        return
+
+    if "contractor_id" not in columns:
+        connection.execute(
+            """
+            ALTER TABLE clients
+            ADD COLUMN contractor_id INTEGER
+            """
+        )
+
+    connection.execute(
+        """
+        CREATE TABLE clients_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            spp_uuid TEXT UNIQUE,
+
+            contractor_id INTEGER UNIQUE,
+
+            inn TEXT,
+            name TEXT,
+
+            enriched INTEGER NOT NULL DEFAULT 0,
+
+            created_at TEXT NOT NULL
+                DEFAULT CURRENT_TIMESTAMP,
+
+            updated_at TEXT NOT NULL
+                DEFAULT CURRENT_TIMESTAMP,
+
+            kpp TEXT,
+            ogrn TEXT,
+
+            director_last_name TEXT,
+            director_first_name TEXT,
+            director_middle_name TEXT,
+            director_inn TEXT,
+            director_position TEXT
+        )
+        """
+    )
+
+    connection.execute(
+        """
+        INSERT INTO clients_new (
+            id,
+            spp_uuid,
+            contractor_id,
+            inn,
+            name,
+            enriched,
+            created_at,
+            updated_at,
+            kpp,
+            ogrn,
+            director_last_name,
+            director_first_name,
+            director_middle_name,
+            director_inn,
+            director_position
+        )
+        SELECT
+            id,
+            spp_uuid,
+            contractor_id,
+            inn,
+            name,
+            enriched,
+            created_at,
+            updated_at,
+            kpp,
+            ogrn,
+            director_last_name,
+            director_first_name,
+            director_middle_name,
+            director_inn,
+            director_position
+        FROM clients
+        """
+    )
+
+    connection.execute(
+        """
+        DROP TABLE clients
+        """
+    )
+
+    connection.execute(
+        """
+        ALTER TABLE clients_new
+        RENAME TO clients
+        """
+    )
+
+
+
+def get_pending_mail_recipients(
+    campaign_id: int,
+    limit: int | None = None,
+) -> list[dict[str, object]]:
+    """
+    Получить получателей кампании, готовых к отправке письма.
+
+    Что делает:
+    - выбирает только строки mail_recipients со статусом `pending`;
+    - добавляет основные данные клиента;
+    - сортирует очередь по mail_recipients.id;
+    - при необходимости ограничивает количество строк.
+
+    Аргументы:
+        campaign_id:
+            ID почтовой кампании.
+
+        limit:
+            Максимальное количество получателей.
+            Если None, возвращается вся очередь.
+
+    Возвращает:
+        Список словарей вида:
+
+        {
+            "recipient_id": ...,
+            "client_id": ...,
+            "name": ...,
+            "inn": ...,
+            "email": ...,
+            "status": ...
+        }
+
+    Исключения:
+        ValueError:
+            Если campaign_id меньше 1;
+            если limit указан и меньше 1.
+    """
+    if campaign_id < 1:
+        raise ValueError(
+            "campaign_id должен быть больше 0"
+        )
+
+    if limit is not None and limit < 1:
+        raise ValueError(
+            "limit должен быть больше 0"
+        )
+
+    query = """
+        SELECT
+            mr.id AS recipient_id,
+            mr.client_id,
+            c.name,
+            c.inn,
+            mr.email,
+            mr.status
+        FROM mail_recipients AS mr
+
+        INNER JOIN clients AS c
+            ON c.id = mr.client_id
+
+        WHERE
+            mr.campaign_id = ?
+            AND mr.status = 'pending'
+
+        ORDER BY
+            mr.id
+    """
+
+    params: list[object] = [
+        campaign_id
+    ]
+
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+
+    with get_connection() as connection:
+        rows = connection.execute(
+            query,
+            tuple(params),
+        ).fetchall()
+
+    return [
+        dict(row)
+        for row in rows
+    ]
+
+
+def get_mail_campaign_stats(
+    campaign_id: int,
+) -> dict[str, int]:
+    """
+    Получить краткую статистику получателей кампании.
+
+    Аргументы:
+        campaign_id:
+            ID почтовой кампании.
+
+    Возвращает:
+        Словарь со счётчиками:
+
+        {
+            "total": ...,
+            "pending": ...,
+            "sent": ...,
+            "delivered": ...,
+            "opened": ...,
+            "clicked": ...,
+            "bounced": ...,
+            "failed": ...,
+            "unsubscribed": ...
+        }
+
+    Исключения:
+        ValueError:
+            Если campaign_id меньше 1.
+    """
+    if campaign_id < 1:
+        raise ValueError(
+            "campaign_id должен быть больше 0"
+        )
+
+    statuses = (
+        "pending",
+        "sent",
+        "delivered",
+        "opened",
+        "clicked",
+        "bounced",
+        "failed",
+        "unsubscribed",
+    )
+
+    stats = {
+        "total": 0,
+        **{
+            status: 0
+            for status in statuses
+        },
+    }
+
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                status,
+                COUNT(*) AS count
+            FROM mail_recipients
+            WHERE campaign_id = ?
+            GROUP BY status
+            """,
+            (campaign_id,),
+        ).fetchall()
+
+    for row in rows:
+        status = row["status"]
+        count = row["count"]
+
+        stats["total"] += count
+
+        if status in stats:
+            stats[status] = count
+
+    return stats
+
+
+def get_mail_campaign(
+    campaign_id: int,
+) -> dict[str, object]:
+    """
+    Получить данные почтовой кампании по её ID.
+
+    Аргументы:
+        campaign_id:
+            ID кампании из таблицы mail_campaigns.
+
+    Возвращает:
+        Словарь с данными кампании:
+
+        {
+            "id": ...,
+            "name": ...,
+            "selection_id": ...,
+            "template_name": ...,
+            "status": ...
+        }
+
+    Исключения:
+        ValueError:
+            Если campaign_id меньше 1.
+
+        LookupError:
+            Если кампания не найдена.
+    """
+    if campaign_id < 1:
+        raise ValueError(
+            "campaign_id должен быть больше 0"
+        )
+
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT
+                id,
+                name,
+                selection_id,
+                template_name,
+                status
+            FROM mail_campaigns
+            WHERE id = ?
+            """,
+            (campaign_id,),
+        ).fetchone()
+
+    if row is None:
+        raise LookupError(
+            f"Кампания с id={campaign_id} не найдена"
+        )
+
+    return dict(row)
+
+
+
+def create_mail_message(
+    *,
+    recipient_id: int,
+    provider: str,
+    provider_message_id: str | None,
+    status: str,
+) -> int:
+    """
+    Создать запись о попытке отправки письма.
+
+    Аргументы:
+        recipient_id:
+            ID получателя из mail_recipients.
+
+        provider:
+            Имя почтового провайдера, например:
+            - mock;
+            - mailgun;
+            - resend.
+
+        provider_message_id:
+            Идентификатор сообщения у провайдера.
+            Может быть None при ошибке отправки.
+
+        status:
+            Статус сообщения, например:
+            - sent;
+            - failed.
+
+    Возвращает:
+        ID созданной записи mail_messages.
+
+    Исключения:
+        ValueError:
+            Если recipient_id меньше 1;
+            если provider или status пустые.
+    """
+    if recipient_id < 1:
+        raise ValueError(
+            "recipient_id должен быть больше 0"
+        )
+
+    provider_name = provider.strip()
+
+    if not provider_name:
+        raise ValueError(
+            "provider не может быть пустым"
+        )
+
+    message_status = status.strip()
+
+    if not message_status:
+        raise ValueError(
+            "status не может быть пустым"
+        )
+
+    with get_connection() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO mail_messages (
+                recipient_id,
+                provider,
+                provider_message_id,
+                status,
+                sent_at
+            )
+            VALUES (
+                ?,
+                ?,
+                ?,
+                ?,
+                CASE
+                    WHEN ? = 'sent'
+                    THEN CURRENT_TIMESTAMP
+                    ELSE NULL
+                END
+            )
+            """,
+            (
+                recipient_id,
+                provider_name,
+                provider_message_id,
+                message_status,
+                message_status,
+            ),
+        )
+
+        return cursor.lastrowid
+
+
+
+def confirm_mail_send(
+    *,
+    recipient_id: int,
+    provider: str,
+    provider_message_id: str | None,
+    success: bool,
+) -> int:
+    """
+    Зафиксировать результат отправки письма.
+
+    Что делает:
+    - проверяет существование получателя;
+    - создаёт запись в mail_messages;
+    - меняет статус mail_recipients;
+    - выполняет обе операции в одной транзакции.
+
+    При успешной отправке:
+    - mail_messages.status = 'sent';
+    - mail_recipients.status = 'sent';
+    - sent_at заполняется текущим временем.
+
+    При ошибке:
+    - mail_messages.status = 'failed';
+    - mail_recipients.status = 'failed';
+    - sent_at остаётся NULL.
+
+    Аргументы:
+        recipient_id:
+            ID получателя из mail_recipients.
+
+        provider:
+            Имя почтового провайдера.
+
+        provider_message_id:
+            Идентификатор сообщения у провайдера.
+            Может быть None при ошибке.
+
+        success:
+            True при успешной отправке,
+            False при ошибке.
+
+    Возвращает:
+        ID созданной записи mail_messages.
+
+    Исключения:
+        ValueError:
+            Если recipient_id меньше 1;
+            если provider пустой.
+
+        LookupError:
+            Если получатель не найден.
+    """
+    if recipient_id < 1:
+        raise ValueError(
+            "recipient_id должен быть больше 0"
+        )
+
+    provider_name = provider.strip()
+
+    if not provider_name:
+        raise ValueError(
+            "provider не может быть пустым"
+        )
+
+    message_status = (
+        "sent"
+        if success
+        else "failed"
+    )
+
+    with get_connection() as connection:
+        recipient = connection.execute(
+            """
+            SELECT
+                id,
+                status
+            FROM mail_recipients
+            WHERE id = ?
+            """,
+            (recipient_id,),
+        ).fetchone()
+
+        if recipient is None:
+            raise LookupError(
+                f"Получатель с id={recipient_id} не найден"
+            )
+        if recipient["status"] != "pending":
+            raise ValueError(
+                f"Получатель id={recipient_id} уже обработан: "
+                f"status={recipient['status']!r}"
+            )
+
+        cursor = connection.execute(
+            """
+            INSERT INTO mail_messages (
+                recipient_id,
+                provider,
+                provider_message_id,
+                status,
+                sent_at
+            )
+            VALUES (
+                ?,
+                ?,
+                ?,
+                ?,
+                CASE
+                    WHEN ? = 'sent'
+                    THEN CURRENT_TIMESTAMP
+                    ELSE NULL
+                END
+            )
+            """,
+            (
+                recipient_id,
+                provider_name,
+                provider_message_id,
+                message_status,
+                message_status,
+            ),
+        )
+
+        connection.execute(
+            """
+            UPDATE mail_recipients
+            SET
+                status = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                message_status,
+                recipient_id,
+            ),
+        )
+
+        return cursor.lastrowid
+
+
+
+def get_failed_mail_recipients(
+    campaign_id: int,
+    limit: int | None = None,
+) -> list[dict[str, object]]:
+    """
+    Получить получателей кампании с неудачной отправкой.
+
+    Что делает:
+    - выбирает только mail_recipients со статусом `failed`;
+    - добавляет основные данные клиента;
+    - сортирует записи по mail_recipients.id;
+    - при необходимости ограничивает количество строк.
+
+    Аргументы:
+        campaign_id:
+            ID почтовой кампании.
+
+        limit:
+            Максимальное количество получателей.
+            Если None, возвращаются все failed-записи.
+
+    Возвращает:
+        Список словарей с данными получателей.
+
+    Исключения:
+        ValueError:
+            Если campaign_id меньше 1;
+            если limit указан и меньше 1.
+    """
+    if campaign_id < 1:
+        raise ValueError(
+            "campaign_id должен быть больше 0"
+        )
+
+    if limit is not None and limit < 1:
+        raise ValueError(
+            "limit должен быть больше 0"
+        )
+
+    query = """
+        SELECT
+            mr.id AS recipient_id,
+            mr.client_id,
+            c.name,
+            c.inn,
+            mr.email,
+            mr.status
+        FROM mail_recipients AS mr
+
+        INNER JOIN clients AS c
+            ON c.id = mr.client_id
+
+        WHERE
+            mr.campaign_id = ?
+            AND mr.status = 'failed'
+
+        ORDER BY
+            mr.id
+    """
+
+    params: list[object] = [
+        campaign_id
+    ]
+
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+
+    with get_connection() as connection:
+        rows = connection.execute(
+            query,
+            tuple(params),
+        ).fetchall()
+
+    return [
+        dict(row)
+        for row in rows
+    ]
+
+
+def retry_failed_mail_recipient(
+    recipient_id: int,
+) -> None:
+    """
+    Вернуть failed-получателя в очередь на повторную отправку.
+
+    Что делает:
+    - находит mail_recipients по recipient_id;
+    - разрешает retry только для статуса `failed`;
+    - меняет статус обратно на `pending`;
+    - обновляет updated_at.
+
+    Аргументы:
+        recipient_id:
+            ID получателя из mail_recipients.
+
+    Исключения:
+        ValueError:
+            Если recipient_id меньше 1;
+            если текущий статус получателя не `failed`.
+
+        LookupError:
+            Если получатель не найден.
+    """
+    if recipient_id < 1:
+        raise ValueError(
+            "recipient_id должен быть больше 0"
+        )
+
+    with get_connection() as connection:
+        recipient = connection.execute(
+            """
+            SELECT
+                id,
+                status
+            FROM mail_recipients
+            WHERE id = ?
+            """,
+            (recipient_id,),
+        ).fetchone()
+
+        if recipient is None:
+            raise LookupError(
+                f"Получатель с id={recipient_id} не найден"
+            )
+
+        if recipient["status"] != "failed":
+            raise ValueError(
+                f"Получатель id={recipient_id} нельзя "
+                f"вернуть в retry: "
+                f"status={recipient['status']!r}"
+            )
+
+        attempt_count = get_mail_recipient_attempt_count(
+            recipient_id
+        )
+
+        if attempt_count >= MAX_MAIL_SEND_ATTEMPTS:
+            raise ValueError(
+                f"Получатель id={recipient_id} достиг "
+                f"максимального количества попыток: {attempt_count}"
+            )
+
+        connection.execute(
+            """
+            UPDATE mail_recipients
+            SET
+                status = 'pending',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (recipient_id,),
+        )
+
+
+def get_mail_recipient_attempt_count(
+    recipient_id: int,
+) -> int:
+    """
+    Получить количество попыток отправки для получателя.
+
+    Что делает:
+    - считает все записи mail_messages,
+      связанные с recipient_id;
+    - учитывает как успешные, так и неуспешные попытки.
+
+    Аргументы:
+        recipient_id:
+            ID получателя из mail_recipients.
+
+    Возвращает:
+        Количество попыток отправки.
+
+    Исключения:
+        ValueError:
+            Если recipient_id меньше 1.
+    """
+    if recipient_id < 1:
+        raise ValueError(
+            "recipient_id должен быть больше 0"
+        )
+
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT
+                COUNT(*) AS count
+            FROM mail_messages
+            WHERE recipient_id = ?
+            """,
+            (recipient_id,),
+        ).fetchone()
+
+    return int(
+        row["count"]
     )

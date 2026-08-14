@@ -232,20 +232,30 @@ async def enrich_selection_clients(
         start=1,
     ):
         spp_uuid = client.get("spp_uuid")
-        client_name = client.get("name")
 
-        if not isinstance(spp_uuid, str) or not spp_uuid:
-            print()
+        if not isinstance(spp_uuid, str) or not spp_uuid.strip():
+            spp_uuid = None
+        else:
+            spp_uuid = spp_uuid.strip()
+
+        contractor_id = client.get("contractor_id")
+        if not isinstance(contractor_id, int):
+            contractor_id = None
+
+        if spp_uuid is None and contractor_id is None:
             print(
                 f"[{index}/{total_clients}] "
-                "SppUuid отсутствует, клиент пропущен."
+                "Нет spp_uuid и contractor_id, клиент пропущен."
             )
             continue
 
+        client_name = client.get("name")
         if isinstance(client_name, str) and client_name:
             display_name = client_name
-        else:
+        elif spp_uuid is not None:
             display_name = spp_uuid
+        else:
+            display_name = str(contractor_id)
 
         print()
         print(
@@ -254,7 +264,8 @@ async def enrich_selection_clients(
         )
 
         card = await get_contractor_card(
-            spp_uuid
+            spp_uuid=spp_uuid,
+            contractor_id=contractor_id,
         )
 
         parsed_card = parse_contractor_card(
@@ -262,7 +273,8 @@ async def enrich_selection_clients(
         )
 
         save_enriched_client(
-            parsed_card
+            parsed_card,
+            contractor_id=contractor_id,
         )
 
         print(
@@ -340,6 +352,14 @@ async def run(
     all_clients = await get_all_clients(
         selection_id
     )
+    # if all_clients:
+    #     print()
+    #     print("DEBUG: первая строка выборки:")
+    #     print(all_clients[0])
+
+    #     print()
+    #     print("DEBUG: поля первой строки:")
+    #     print(list(all_clients[0].keys()))
 
     saved_count = upsert_clients(
         all_clients,

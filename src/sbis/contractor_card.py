@@ -34,61 +34,96 @@ import asyncio
 from src.config import get_sbis_url, require_env
 from src.sbis.records import record_to_dict
 
-
 def build_contractor_card_payload(
-    spp_uuid: str,
-) -> dict[str, Any]:
+    *,
+    spp_uuid: str | None = None,
+    contractor_id: int | None = None,
+) -> dict[str, object]:
     """
     Сформировать JSON-RPC payload для ContractorCard.Read.
 
-    Что делает:
-    - принимает SppUuid организации;
-    - очищает значение от пробелов по краям;
-    - проверяет, что UUID не пустой;
-    - подставляет UUID в поле ContractorUUID;
-    - формирует полный JSON-RPC запрос ContractorCard.Read.
+    Поддерживает два способа идентификации контрагента:
+
+    1. Через spp_uuid:
+       - поле ИдО остаётся None;
+       - в ДопПоля передаётся ContractorUUID.
+
+    2. Через contractor_id:
+       - значение передаётся непосредственно в поле ИдО;
+       - ContractorUUID в ДопПоля не добавляется.
+
+    Приоритет имеет spp_uuid. Если переданы оба идентификатора,
+    запрос будет сформирован через ContractorUUID.
 
     Аргументы:
         spp_uuid:
-            SppUuid организации, полученный из
-            CRMClients.ListClientsOnline.
+            UUID контрагента СБИС.
+
+        contractor_id:
+            Числовой идентификатор контрагента для поля ИдО.
 
     Возвращает:
-        Готовый словарь JSON-RPC запроса.
+        Готовый JSON-RPC payload ContractorCard.Read.
 
     Исключения:
-        ValueError:
-            Если spp_uuid пустой после очистки.
-    """
-    clean_uuid = spp_uuid.strip()
+        TypeError:
+            Если contractor_id передан не как int.
 
-    if not clean_uuid:
-        raise ValueError(
-            "SppUuid не должен быть пустым"
+        ValueError:
+            Если отсутствуют оба идентификатора.
+    """
+    if spp_uuid is not None:
+        spp_uuid = spp_uuid.strip()
+
+        if not spp_uuid:
+            spp_uuid = None
+
+    if (
+        contractor_id is not None
+        and not isinstance(contractor_id, int)
+    ):
+        raise TypeError(
+            "contractor_id должен быть int или None"
         )
+
+    if spp_uuid is None and contractor_id is None:
+        raise ValueError(
+            "Для ContractorCard.Read нужен "
+            "spp_uuid или contractor_id"
+        )
+
+    extra_fields: dict[str, object] = {
+        "browser": True,
+        "firstLoad": True,
+        "page": "crm",
+        "isRead": True,
+        "anchor": "about",
+        "CountryCode": "643",
+        "accordion": True,
+    }
+
+    if spp_uuid is not None:
+        extra_fields["ContractorUUID"] = spp_uuid
 
     return {
         "jsonrpc": "2.0",
         "protocol": 7,
         "method": "ContractorCard.Read",
         "params": {
-            "ИдО": None,
+            "ИдО": (
+                contractor_id
+                if spp_uuid is None
+                else None
+            ),
             "ИмяМетода": None,
-            "ДопПоля": {
-                "browser": True,
-                "firstLoad": True,
-                "page": "crm",
-                "ContractorUUID": clean_uuid,
-                "isRead": True,
-                "anchor": "about",
-                "CountryCode": "643",
-                "accordion": True,
-            },
+            "ДопПоля": extra_fields,
         },
         "id": 1,
     }
 async def get_contractor_card(
-    spp_uuid: str,
+    *,
+    spp_uuid: str | None = None,
+    contractor_id: int | None = None,
 ) -> dict[str, Any]:
     """
     Получить подробную карточку организации по SppUuid.
@@ -125,7 +160,8 @@ async def get_contractor_card(
     url = get_sbis_url()
 
     payload = build_contractor_card_payload(
-        spp_uuid
+        spp_uuid=spp_uuid,
+        contractor_id=contractor_id,
     )
 
     headers = {

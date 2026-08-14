@@ -100,7 +100,6 @@ async def send_raw_request(
         f".{selection_id}..",
     )
 
-    print(f"Выборка СБИС: {selection_id}")
     if position is not None:
         navigation = payload["params"]["Навигация"]
 
@@ -132,7 +131,6 @@ async def send_raw_request(
     print(f"Метод: {payload.get('method')}")
 
     selection_id = require_env("SBIS_SELECTION_ID")
-    print(f"Выборка СБИС: {selection_id}")
 
     async with aiohttp.ClientSession(
         timeout=timeout,
@@ -232,3 +230,5 @@ def set_record_value(
     raise ValueError(
         f'Поле "{field_name}" не найдено в record'
     )
+
+
