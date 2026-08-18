@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-
+import secrets
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATABASE_DIR = PROJECT_ROOT / "data"
@@ -850,6 +850,8 @@ def initialize_mailing_tables(
 
             provider_message_id TEXT,
 
+            tracking_token TEXT,
+
             status TEXT NOT NULL DEFAULT 'pending',
 
             sent_at TEXT,
@@ -866,6 +868,21 @@ def initialize_mailing_tables(
         )
         """
     )
+
+    message_columns = {
+        row["name"]
+        for row in connection.execute(
+            "PRAGMA table_info(mail_messages)"
+        ).fetchall()
+    }
+
+    if "tracking_token" not in message_columns:
+        connection.execute(
+            """
+            ALTER TABLE mail_messages
+            ADD COLUMN tracking_token TEXT
+            """
+        )
 
     connection.execute(
         """
@@ -944,6 +961,14 @@ def initialize_mailing_tables(
         CREATE INDEX IF NOT EXISTS
             idx_mail_messages_provider_message_id
         ON mail_messages(provider_message_id)
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS
+            idx_mail_messages_tracking_token
+        ON mail_messages(tracking_token)
         """
     )
 
@@ -1367,7 +1392,9 @@ def get_pending_mail_recipients(
             c.name,
             c.inn,
             mr.email,
-            mr.status
+            mr.status,
+            c.director_first_name,
+            c.director_middle_name
         FROM mail_recipients AS mr
 
         INNER JOIN clients AS c
@@ -1625,7 +1652,257 @@ def create_mail_message(
 
         return cursor.lastrowid
 
+def create_mail_message(
+    *,
+    recipient_id: int,
+    provider: str,
+) -> dict:
+    """
+    Создать попытку отправки письма до обращения к SMTP.
 
+    Что делает:
+    - проверяет существование получателя;
+    - разрешает создание попытки только для pending-получателя;
+    - генерирует криптографически случайный tracking_token;
+    - создаёт запись mail_messages со статусом pending;
+    - возвращает ID сообщения и tracking_token.
+
+    Аргументы:
+        recipient_id:
+            ID получателя из mail_recipients.
+
+        provider:
+            Имя почтового провайдера, например "smtp" или "mock".
+
+    Возвращает:
+        Словарь:
+        {
+            "message_id": int,
+            "tracking_token": str,
+        }
+
+    Исключения:
+        ValueError:
+            Если recipient_id некорректен,
+            provider пустой
+            или получатель уже не находится в pending.
+
+        RuntimeError:
+            Если запись mail_messages создать не удалось.
+    """
+    if recipient_id < 1:
+        raise ValueError(
+            "recipient_id должен быть больше 0"
+        )
+
+    clean_provider = provider.strip()
+
+    if not clean_provider:
+        raise ValueError(
+            "provider не может быть пустым"
+        )
+
+    tracking_token = secrets.token_urlsafe(24)
+
+    with get_connection() as connection:
+        recipient = connection.execute(
+            """
+            SELECT
+                id,
+                status
+            FROM mail_recipients
+            WHERE id = ?
+            """,
+            (recipient_id,),
+        ).fetchone()
+
+        if recipient is None:
+            raise ValueError(
+                f"Получатель #{recipient_id} не найден"
+            )
+
+        recipient_status = recipient["status"]
+
+        if recipient_status != "pending":
+            raise ValueError(
+                f"Получатель #{recipient_id} имеет статус "
+                f"{recipient_status!r}, ожидался 'pending'"
+            )
+
+        cursor = connection.execute(
+            """
+            INSERT INTO mail_messages (
+                recipient_id,
+                provider,
+                status,
+                tracking_token
+            )
+            VALUES (?, ?, 'pending', ?)
+            """,
+            (
+                recipient_id,
+                clean_provider,
+                tracking_token,
+            ),
+        )
+
+        message_id = cursor.lastrowid
+
+        if message_id is None:
+            raise RuntimeError(
+                "Не удалось получить id созданного mail_messages"
+            )
+
+    return {
+        "message_id": int(message_id),
+        "tracking_token": tracking_token,
+    }
+
+
+def complete_mail_message(
+    *,
+    message_id: int,
+    provider_message_id: str | None,
+    success: bool,
+    error: str | None = None,
+) -> None:
+    """
+    Завершить ранее созданную попытку отправки.
+
+    Что делает:
+    - находит существующую запись mail_messages;
+    - меняет её статус на sent или failed;
+    - сохраняет provider_message_id;
+    - при успехе устанавливает sent_at;
+    - обновляет статус mail_recipients;
+    - создаёт событие sent или failed в mail_events.
+
+    Аргументы:
+        message_id:
+            ID попытки из mail_messages.
+
+        provider_message_id:
+            Идентификатор письма у SMTP/provider.
+            Может быть None при ошибке отправки.
+
+        success:
+            True, если SMTP/provider принял письмо.
+
+        error:
+            Описание ошибки отправки.
+            Используется для события failed.
+
+    Возвращает:
+        None.
+
+    Исключения:
+        ValueError:
+            Если message_id некорректен,
+            запись не существует
+            или попытка уже завершена.
+    """
+    if message_id < 1:
+        raise ValueError(
+            "message_id должен быть больше 0"
+        )
+
+    message_status = (
+        "sent"
+        if success
+        else "failed"
+    )
+
+    event_type = message_status
+
+    with get_connection() as connection:
+        message = connection.execute(
+            """
+            SELECT
+                id,
+                recipient_id,
+                status
+            FROM mail_messages
+            WHERE id = ?
+            """,
+            (message_id,),
+        ).fetchone()
+
+        if message is None:
+            raise ValueError(
+                f"mail_messages #{message_id} не найден"
+            )
+
+        if message["status"] != "pending":
+            raise ValueError(
+                f"mail_messages #{message_id} уже имеет статус "
+                f"{message['status']!r}"
+            )
+
+        recipient_id = int(
+            message["recipient_id"]
+        )
+
+        if success:
+            connection.execute(
+                """
+                UPDATE mail_messages
+                SET
+                    provider_message_id = ?,
+                    status = 'sent',
+                    sent_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    provider_message_id,
+                    message_id,
+                ),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE mail_messages
+                SET
+                    provider_message_id = ?,
+                    status = 'failed',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    provider_message_id,
+                    message_id,
+                ),
+            )
+
+        connection.execute(
+            """
+            UPDATE mail_recipients
+            SET
+                status = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                message_status,
+                recipient_id,
+            ),
+        )
+
+        connection.execute(
+            """
+            INSERT INTO mail_events (
+                message_id,
+                event_type,
+                event_data
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                message_id,
+                event_type,
+                error,
+            ),
+        )
 
 def confirm_mail_send(
     *,
