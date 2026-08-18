@@ -347,7 +347,7 @@ def build_mail_message(
         director_middle_name=director_middle_name,
         client_name=client_name,
         inn=inn,
-        racking_token=tracking_token,
+        tracking_token=tracking_token,
     )
 
     text_body = template.build_text_body(
@@ -355,7 +355,7 @@ def build_mail_message(
         director_middle_name=director_middle_name,
         client_name=client_name,
         inn=inn,
-        racking_token=tracking_token,
+        tracking_token=tracking_token,
     )
 
     html_body = template.build_html_body(
@@ -363,7 +363,7 @@ def build_mail_message(
         director_middle_name=director_middle_name,
         client_name=client_name,
         inn=inn,
-        racking_token=tracking_token,
+        tracking_token=tracking_token,
     ) 
 
     return MailMessage(
