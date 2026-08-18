@@ -26,10 +26,16 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 import secrets
+import os
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATABASE_DIR = PROJECT_ROOT / "data"
-DATABASE_FILE = DATABASE_DIR / "project.db"
+DATABASE_FILE = Path(
+    os.getenv(
+        "PROJECT_DB_PATH",
+        DATABASE_DIR / "project.db",
+    )
+)
 MAX_MAIL_SEND_ATTEMPTS = 3
 
 def get_connection() -> sqlite3.Connection:
