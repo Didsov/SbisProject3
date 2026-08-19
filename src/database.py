@@ -1608,35 +1608,23 @@ def get_pending_mail_recipients(
         for row in rows
     ]
 
-
 def get_mail_campaign_stats(
     campaign_id: int,
-) -> dict[str, int]:
+) -> dict[str, int | float]:
     """
-    Получить краткую статистику получателей кампании.
+    Получить статистику почтовой кампании.
 
-    Аргументы:
-        campaign_id:
-            ID почтовой кампании.
+    Считает:
+    - статусы получателей;
+    - реально отправленные письма;
+    - открытия;
+    - клики;
+    - уникальные открытия и клики;
+    - процент открытия и CTR;
+    - переходы по отдельным каналам.
 
-    Возвращает:
-        Словарь со счётчиками:
-
-        {
-            "total": ...,
-            "pending": ...,
-            "sent": ...,
-            "delivered": ...,
-            "opened": ...,
-            "clicked": ...,
-            "bounced": ...,
-            "failed": ...,
-            "unsubscribed": ...
-        }
-
-    Исключения:
-        ValueError:
-            Если campaign_id меньше 1.
+    Тестовые письма с is_test = 1
+    в боевую статистику не входят.
     """
     if campaign_id < 1:
         raise ValueError(
@@ -1654,12 +1642,25 @@ def get_mail_campaign_stats(
         "unsubscribed",
     )
 
-    stats = {
+    stats: dict[str, int | float] = {
         "total": 0,
         **{
             status: 0
             for status in statuses
         },
+        "messages_sent": 0,
+        "opens_total": 0,
+        "opened_unique": 0,
+        "open_rate": 0.0,
+        "clicks_total": 0,
+        "clicked_unique": 0,
+        "click_rate": 0.0,
+        "click_to_open_rate": 0.0,
+        "click_phone": 0,
+        "click_whatsapp": 0,
+        "click_telegram": 0,
+        "click_max": 0,
+        "click_cta_email": 0,
     }
 
     with get_connection() as connection:
@@ -1675,18 +1676,173 @@ def get_mail_campaign_stats(
             (campaign_id,),
         ).fetchall()
 
-    for row in rows:
-        status = row["status"]
-        count = row["count"]
+        for row in rows:
+            status = row["status"]
+            count = int(row["count"])
 
-        stats["total"] += count
+            stats["total"] = int(
+                stats["total"]
+            ) + count
 
-        if status in stats:
-            stats[status] = count
+            if status in stats:
+                stats[status] = count
+
+        sent_row = connection.execute(
+            """
+            SELECT
+                COUNT(*) AS sent
+            FROM mail_messages AS mm
+
+            INNER JOIN mail_recipients AS mr
+                ON mr.id = mm.recipient_id
+
+            WHERE
+                mr.campaign_id = ?
+                AND mm.is_test = 0
+                AND mm.status = 'sent'
+            """,
+            (campaign_id,),
+        ).fetchone()
+
+        messages_sent = int(
+            sent_row["sent"]
+        )
+
+        stats["messages_sent"] = messages_sent
+
+        event_row = connection.execute(
+            """
+            SELECT
+                SUM(
+                    CASE
+                        WHEN me.event_type = 'opened'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS opens_total,
+
+                COUNT(
+                    DISTINCT CASE
+                        WHEN me.event_type = 'opened'
+                        THEN mm.id
+                    END
+                ) AS opened_unique,
+
+                SUM(
+                    CASE
+                        WHEN me.event_type = 'clicked'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS clicks_total,
+
+                COUNT(
+                    DISTINCT CASE
+                        WHEN me.event_type = 'clicked'
+                        THEN mm.id
+                    END
+                ) AS clicked_unique
+
+            FROM mail_messages AS mm
+
+            INNER JOIN mail_recipients AS mr
+                ON mr.id = mm.recipient_id
+
+            LEFT JOIN mail_events AS me
+                ON me.message_id = mm.id
+
+            WHERE
+                mr.campaign_id = ?
+                AND mm.is_test = 0
+                AND mm.status = 'sent'
+            """,
+            (campaign_id,),
+        ).fetchone()
+
+        opens_total = int(
+            event_row["opens_total"] or 0
+        )
+
+        opened_unique = int(
+            event_row["opened_unique"] or 0
+        )
+
+        clicks_total = int(
+            event_row["clicks_total"] or 0
+        )
+
+        clicked_unique = int(
+            event_row["clicked_unique"] or 0
+        )
+
+        stats["opens_total"] = opens_total
+        stats["opened_unique"] = opened_unique
+        stats["clicks_total"] = clicks_total
+        stats["clicked_unique"] = clicked_unique
+
+        channel_rows = connection.execute(
+            """
+            SELECT
+                me.event_data,
+                COUNT(DISTINCT mm.id) AS unique_messages
+
+            FROM mail_messages AS mm
+
+            INNER JOIN mail_recipients AS mr
+                ON mr.id = mm.recipient_id
+
+            INNER JOIN mail_events AS me
+                ON me.message_id = mm.id
+
+            WHERE
+                mr.campaign_id = ?
+                AND mm.is_test = 0
+                AND mm.status = 'sent'
+                AND me.event_type = 'clicked'
+
+            GROUP BY me.event_data
+            """,
+            (campaign_id,),
+        ).fetchall()
+
+        event_data_to_metric = {
+            '{"click_key":"phone"}': "click_phone",
+            '{"click_key":"whatsapp"}': "click_whatsapp",
+            '{"click_key":"telegram"}': "click_telegram",
+            '{"click_key":"max"}': "click_max",
+            '{"click_key":"cta_email"}': "click_cta_email",
+        }
+
+        for row in channel_rows:
+            metric_name = event_data_to_metric.get(
+                row["event_data"]
+            )
+
+            if metric_name is None:
+                continue
+
+            stats[metric_name] = int(
+                row["unique_messages"]
+            )
+
+    if messages_sent > 0:
+        stats["open_rate"] = round(
+            opened_unique / messages_sent * 100,
+            2,
+        )
+
+        stats["click_rate"] = round(
+            clicked_unique / messages_sent * 100,
+            2,
+        )
+
+    if opened_unique > 0:
+        stats["click_to_open_rate"] = round(
+            clicked_unique / opened_unique * 100,
+            2,
+        )
 
     return stats
-
-
 def get_mail_campaign(
     campaign_id: int,
 ) -> dict[str, object]:
