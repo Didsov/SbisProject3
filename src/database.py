@@ -242,6 +242,8 @@ def initialize_database() -> None:
         initialize_mailing_tables(
             connection
         )
+    ensure_default_mail_campaign()
+    
 
 
 
@@ -2246,3 +2248,112 @@ def get_mail_recipient_attempt_count(
     return int(
         row["count"]
     )
+
+
+
+def record_mail_open(
+    tracking_token: str,
+) -> bool:
+    """
+    Зафиксировать открытие письма по tracking_token.
+
+    Что делает:
+    - принимает непрозрачный tracking_token из URL пикселя;
+    - ищет соответствующую запись в mail_messages;
+    - если письмо найдено, добавляет событие `opened`
+      в таблицу mail_events;
+    - если token неизвестен или пустой, ничего не меняет.
+
+    Аргументы:
+        tracking_token:
+            Уникальный tracking token из mail_messages.
+
+    Возвращает:
+        True:
+            Письмо найдено и событие `opened` записано.
+
+        False:
+            Token пустой или соответствующее письмо не найдено.
+
+    Примечание:
+        Повторные загрузки пикселя сейчас сохраняются как отдельные
+        события. Для аналитики уникальное открытие позже можно считать
+        как наличие хотя бы одного `opened` для конкретного message_id.
+    """
+    token = tracking_token.strip()
+
+    if not token:
+        return False
+
+    with get_connection() as connection:
+        message = connection.execute(
+            """
+            SELECT id
+            FROM mail_messages
+            WHERE tracking_token = ?
+            """,
+            (token,),
+        ).fetchone()
+
+        if message is None:
+            return False
+
+        connection.execute(
+            """
+            INSERT INTO mail_events (
+                message_id,
+                event_type
+            )
+            VALUES (?, ?)
+            """,
+            (
+                message["id"],
+                "opened",
+            ),
+        )
+
+        return True
+
+
+def ensure_default_mail_campaign() -> int:
+    """
+    Гарантировать наличие основной почтовой кампании проекта.
+
+    Что делает:
+    - проверяет наличие кампании `new_companies_daily`;
+    - если кампании нет, создаёт её для выборки СБИС #5984;
+    - гарантирует использование шаблона `new_companies`;
+    - не создаёт дубликаты при повторных запусках;
+    - возвращает ID основной кампании.
+
+    Возвращает:
+        ID основной почтовой кампании.
+
+    Исключения:
+        ValueError:
+            Если кампания с именем `new_companies_daily`
+            уже существует, но привязана к другой выборке.
+    """
+    campaign_id = get_or_create_mail_campaign(
+        name="new_companies_daily",
+        selection_id=5984,
+    )
+
+    with get_connection() as connection:
+        connection.execute(
+            """
+            UPDATE mail_campaigns
+            SET template_name = ?
+            WHERE id = ?
+              AND (
+                    template_name IS NULL
+                    OR TRIM(template_name) = ''
+                  )
+            """,
+            (
+                "new_companies",
+                campaign_id,
+            ),
+        )
+
+    return campaign_id
