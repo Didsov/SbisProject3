@@ -47,8 +47,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-
-from src.config import load_environment
+from pathlib import Path
 from src.database import (
     get_unenriched_clients,
     initialize_database,
@@ -59,9 +58,181 @@ from src.sbis.card_parser import parse_contractor_card
 from src.sbis.client_list import get_all_clients
 from src.sbis.contractor_card import get_contractor_card
 
+from src.database import upsert_client_by_inn_lookup
+from src.sbis.company_search import search_company_uuid_by_inn
+
+from src.database import (
+    add_client_source,
+    upsert_client_by_inn_lookup,
+)
+
 
 CONTRACTOR_CARD_DELAY_SECONDS = 3
+def load_inns(
+    *,
+    inn: str | None,
+    inn_file: str | None,
+) -> list[str]:
+    """
+    Получить нормализованный список ИНН для режима загрузки по ИНН.
 
+    Источники:
+    - одиночный ИНН из --inn;
+    - текстовый файл из --inn-file.
+
+    Формат файла:
+    - один ИНН на строку;
+    - пустые строки игнорируются;
+    - повторяющиеся ИНН удаляются
+      с сохранением исходного порядка.
+
+    Аргументы:
+        inn:
+            Одиночный ИНН из CLI.
+
+        inn_file:
+            Путь к текстовому файлу со списком ИНН.
+
+    Возвращает:
+        Список уникальных ИНН.
+
+    Исключения:
+        ValueError:
+            Если ИНН содержит не 10 и не 12 цифр.
+
+        FileNotFoundError:
+            Если указанный файл не существует.
+    """
+    if inn is not None:
+        raw_values = [
+            inn
+        ]
+
+    elif inn_file is not None:
+        file_path = Path(
+            inn_file
+        )
+
+        raw_values = file_path.read_text(
+            encoding="utf-8-sig"
+        ).splitlines()
+
+    else:
+        return []
+
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for raw_value in raw_values:
+        clean_inn = raw_value.strip()
+
+        if not clean_inn:
+            continue
+
+        if (
+            not clean_inn.isdigit()
+            or len(clean_inn) not in (10, 12)
+        ):
+            raise ValueError(
+                f"Некорректный ИНН: {clean_inn!r}. "
+                "Ожидается 10 или 12 цифр."
+            )
+
+        if clean_inn in seen:
+            continue
+
+        seen.add(
+            clean_inn
+        )
+
+        result.append(
+            clean_inn
+        )
+
+    return result
+
+
+async def load_clients_by_inn(
+    inns: list[str],
+    *,
+    source_type: str,
+    source_value: str,
+) -> list[dict[str, str]]:
+    """
+    Найти организации СБИС по списку ИНН и сохранить их в clients.
+
+    Что делает:
+    - проходит по списку ИНН;
+    - для каждого ИНН вызывает Contractor.SearchSuggest;
+    - получает точный SppUuid;
+    - создаёт или обновляет клиента в таблице clients;
+    - не создаёт связь client_selections;
+    - не выполняет ContractorCard.Read;
+    - возвращает список успешно найденных организаций.
+
+    Аргументы:
+        inns:
+            Нормализованный список ИНН.
+
+    Возвращает:
+        Список словарей:
+            {
+                "inn": "...",
+                "spp_uuid": "..."
+            }
+
+        Если организация по ИНН не найдена,
+        она не попадает в возвращаемый список.
+    """
+    found_clients: list[dict[str, str]] = []
+
+    total = len(inns)
+
+    for index, inn in enumerate(
+        inns,
+        start=1,
+    ):
+        print()
+        print(
+            f"[{index}/{total}] "
+            f"Поиск ИНН {inn}"
+        )
+
+        spp_uuid = await search_company_uuid_by_inn(
+            inn
+        )
+
+        if spp_uuid is None:
+            print(
+                "Организация не найдена."
+            )
+            continue
+
+        client_id = upsert_client_by_inn_lookup(
+            inn=inn,
+            spp_uuid=spp_uuid,
+        )
+        add_client_source(
+            client_id=client_id,
+            source_type=source_type,
+            source_value=source_value,
+        )
+
+        print(
+            f"SppUuid: {spp_uuid}"
+        )
+        print(
+            f"clients.id: {client_id}"
+        )
+
+        found_clients.append(
+            {
+                "inn": inn,
+                "spp_uuid": spp_uuid,
+            }
+        )
+
+    return found_clients
 
 def parse_arguments() -> argparse.Namespace:
     """
@@ -109,8 +280,27 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--selection",
         type=int,
-        required=True,
+        default=None,
         help="Номер выборки клиентов СБИС.",
+    )
+    parser.add_argument(
+        "--inn",
+        type=str,
+        default=None,
+        help=(
+            "Загрузить и обогатить одну организацию "
+            "по точному ИНН."
+        ),
+    )
+
+    parser.add_argument(
+        "--inn-file",
+        type=str,
+        default=None,
+        help=(
+            "Путь к текстовому файлу со списком ИНН. "
+            "Один ИНН на строку."
+        ),
     )
 
     parser.add_argument(
@@ -123,6 +313,7 @@ def parse_arguments() -> argparse.Namespace:
             "0 — не запускать ограниченное обогащение."
         ),
     )
+    
 
     parser.add_argument(
         "--enrich-all",
@@ -135,16 +326,32 @@ def parse_arguments() -> argparse.Namespace:
 
     arguments = parser.parse_args()
 
-    if arguments.selection <= 0:
+    if (
+        arguments.selection is not None
+        and arguments.selection <= 0
+    ):
         parser.error(
             "--selection должен быть больше 0"
         )
-
     if arguments.enrich_limit < 0:
         parser.error(
             "--enrich-limit не может быть меньше 0"
         )
 
+
+    source_count = sum(
+        [
+            arguments.selection is not None,
+            arguments.inn is not None,
+            arguments.inn_file is not None,
+        ]
+    )
+
+    if source_count != 1:
+        parser.error(
+            "Нужно указать ровно один источник: "
+            "--selection, --inn или --inn-file"
+        )
     return arguments
 
 
@@ -309,7 +516,10 @@ async def enrich_selection_clients(
 
 
 async def run(
-    selection_id: int,
+    *,
+    selection_id: int | None,
+    inn: str | None,
+    inn_file: str | None,
     enrich_limit: int,
     enrich_all: bool,
 ) -> None:
@@ -342,12 +552,59 @@ async def run(
     Возвращает:
         None.
     """
-    load_environment()
     initialize_database()
+    if inn is not None or inn_file is not None:
+        inns = load_inns(
+            inn=inn,
+            inn_file=inn_file,
+        )
+
+        if not inns:
+            print(
+                "Список ИНН пуст."
+            )
+            return
+
+        print(
+            f"ИНН для обработки: {len(inns)}"
+        )
+
+        if inn_file is not None:
+            source_type = "inn_file"
+            source_value = Path(
+                inn_file
+            ).name
+        else:
+            source_type = "manual_inn"
+            source_value = inns[0]
+
+        found_clients = await load_clients_by_inn(
+            inns,
+            source_type=source_type,
+            source_value=source_value,
+        )
+
+        print()
+        print(
+            "Организаций найдено и сохранено: "
+            f"{len(found_clients)}"
+        )
+
+        if enrich_all and found_clients:
+            await enrich_inn_clients(
+                found_clients
+            )
+
+        return
 
     print(
         f"Получаю выборку СБИС #{selection_id}..."
     )
+    if selection_id is None:
+        raise RuntimeError(
+            "selection_id отсутствует "
+            "для режима загрузки выборки"
+        )
 
     all_clients = await get_all_clients(
         selection_id
@@ -388,6 +645,74 @@ async def run(
     )
 
 
+async def enrich_inn_clients(
+    clients: list[dict[str, str]],
+) -> None:
+    """
+    Обогатить организации, найденные по ИНН.
+
+    Что делает:
+    - принимает список организаций с inn и spp_uuid;
+    - для каждой организации вызывает ContractorCard.Read;
+    - разбирает карточку через parse_contractor_card();
+    - сохраняет реквизиты, директора и контакты;
+    - выдерживает паузу между запросами.
+
+    Аргументы:
+        clients:
+            Список словарей вида:
+            {
+                "inn": "...",
+                "spp_uuid": "..."
+            }
+
+    Возвращает:
+        None.
+    """
+    total = len(clients)
+
+    for index, client in enumerate(
+        clients,
+        start=1,
+    ):
+        inn = client["inn"]
+        spp_uuid = client["spp_uuid"]
+
+        print()
+        print(
+            f"[{index}/{total}] "
+            f"ContractorCard.Read: ИНН {inn}"
+        )
+
+        card = await get_contractor_card(
+            spp_uuid=spp_uuid,
+            contractor_id=None,
+        )
+
+        parsed_card = parse_contractor_card(
+            card
+        )
+
+        save_enriched_client(
+            parsed_card,
+            contractor_id=None,
+        )
+
+        print(
+            "Карточка сохранена."
+        )
+
+        if index < total:
+            print(
+                "Ожидание "
+                f"{CONTRACTOR_CARD_DELAY_SECONDS} "
+                "секунды перед следующим запросом..."
+            )
+
+            await asyncio.sleep(
+                CONTRACTOR_CARD_DELAY_SECONDS
+            )
+
 def main() -> None:
     """
     Запустить CLI-сценарий загрузки клиентов из СБИС.
@@ -405,6 +730,8 @@ def main() -> None:
     asyncio.run(
         run(
             selection_id=arguments.selection,
+            inn=arguments.inn,
+            inn_file=arguments.inn_file,
             enrich_limit=arguments.enrich_limit,
             enrich_all=arguments.enrich_all,
         )

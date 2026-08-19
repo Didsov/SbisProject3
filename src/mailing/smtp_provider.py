@@ -36,8 +36,14 @@ from dataclasses import dataclass
 from email.message import EmailMessage
 from email.utils import formataddr, make_msgid
 from typing import Protocol
-
-from dotenv import load_dotenv
+from src.config import (
+    MAIL_FROM_EMAIL,
+    MAIL_FROM_NAME,
+    MAIL_SMTP_HOST,
+    MAIL_SMTP_PASSWORD,
+    MAIL_SMTP_PORT,
+    MAIL_SMTP_USERNAME,
+)
 
 LOGO_PATH = (
     Path(__file__).resolve().parent
@@ -170,14 +176,13 @@ class SMTPMailProvider:
                 Если обязательная настройка отсутствует
                 или MAIL_SMTP_PORT не является числом.
         """
-        load_dotenv()
 
-        host = os.getenv("MAIL_SMTP_HOST", "").strip()
-        port_raw = os.getenv("MAIL_SMTP_PORT", "").strip()
-        username = os.getenv("MAIL_SMTP_USERNAME", "").strip()
-        password = os.getenv("MAIL_SMTP_PASSWORD", "")
-        from_email = os.getenv("MAIL_FROM_EMAIL", "").strip()
-        from_name = os.getenv("MAIL_FROM_NAME", "").strip()
+        host = (MAIL_SMTP_HOST or "").strip()
+        port_raw = MAIL_SMTP_PORT
+        username = (MAIL_SMTP_USERNAME or "").strip()
+        password = MAIL_SMTP_PASSWORD or ""
+        from_email = (MAIL_FROM_EMAIL or "").strip()
+        from_name = (MAIL_FROM_NAME or "").strip()
 
         required_values = {
             "MAIL_SMTP_HOST": host,

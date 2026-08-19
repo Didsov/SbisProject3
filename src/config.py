@@ -28,13 +28,30 @@ from dotenv import load_dotenv
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
 LOCAL_ENV_FILE = PROJECT_ROOT / ".env"
+REQUEST_FILE = PROJECT_ROOT / "config" / "request.json"
 
 PRODUCTION_ENV_FILE = Path(
     "/etc/projectsbis/projectsbis.env"
 )
 
+def get_sbis_url() -> str:
+    """
+    Получить URL endpoint СБИС.
+
+    Возвращает:
+        Значение SBIS_URL из окружения.
+
+        Если переменная не задана, используется:
+        https://online.sbis.ru/service/
+    """
+    return (
+        optional_env(
+            "SBIS_URL",
+            "https://online.sbis.ru/service/",
+        )
+        or "https://online.sbis.ru/service/"
+    ).strip()
 
 def load_project_env() -> Path | None:
     """

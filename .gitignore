@@ -51,3 +51,6 @@ desktop.ini
 !.vscode/launch.json
 
 .exports
+exports
+lists
+*.txt

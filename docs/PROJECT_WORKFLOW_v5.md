@@ -193,7 +193,21 @@ python -m src.client_loader --selection 41307 --enrich-limit 10
 python -m src.client_loader --selection 41307 --enrich-all
 ```
 
+### Загрузка одной организации по ИНН
+
+```powershell
+python -m src.client_loader --inn 251118147906 --enrich-all
+```
+### Загрузка организаций из файла со списком ИНН
+```powershell
+python -m src.client_loader --inn-file .\lists\list.txt --enrich-all
+```
+
+
+
 ---
+
+
 
 ## 6. Последовательный сбор 41307 и 42420
 
@@ -453,6 +467,15 @@ python -m src.sql_export --query all_full_clients
 ```powershell
 python -m src.sql_export --query selection_full_clients --param selection_id=41307
 ```
+
+### Экспорт клиентов из конкретного списка ИНН
+
+
+```powershell
+python -m src.sql_export --query source_full_clients --param source_type=inn_file --param source_value=test_inns.txt
+```
+
+
 
 ### Выполнить SQL напрямую из файла
 

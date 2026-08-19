@@ -234,6 +234,9 @@ def initialize_database() -> None:
         initialize_client_selections_table(
             connection
         )
+        initialize_client_sources_table(
+            connection
+        )
 
         initialize_mailing_tables(
             connection
@@ -736,6 +739,170 @@ def initialize_client_selections_table(
         """
     )
 
+def initialize_client_sources_table(
+    connection: sqlite3.Connection,
+) -> None:
+    """
+    Создать таблицу источников клиентов.
+
+    Назначение:
+    - хранить, откуда именно клиент был получен;
+    - позволять одному клиенту иметь несколько источников;
+    - не перезаписывать старый источник новым;
+    - отдельно хранить тип источника и его значение.
+
+    Примеры:
+        source_type = "inn_file"
+        source_value = "clients_august.txt"
+
+        source_type = "manual_inn"
+        source_value = "251118147906"
+
+    Таблица client_sources:
+        id:
+            Внутренний идентификатор записи.
+
+        client_id:
+            Ссылка на clients.id.
+
+        source_type:
+            Тип источника.
+
+        source_value:
+            Значение источника.
+
+        created_at:
+            Время первого появления источника.
+
+        updated_at:
+            Время последнего подтверждения источника.
+
+    Особенности:
+        UNIQUE(client_id, source_type, source_value)
+        не позволяет сохранять один и тот же источник повторно.
+    """
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS client_sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            client_id INTEGER NOT NULL,
+
+            source_type TEXT NOT NULL,
+            source_value TEXT NOT NULL,
+
+            created_at TEXT NOT NULL
+                DEFAULT CURRENT_TIMESTAMP,
+
+            updated_at TEXT NOT NULL
+                DEFAULT CURRENT_TIMESTAMP,
+
+            FOREIGN KEY (client_id)
+                REFERENCES clients (id)
+                ON DELETE CASCADE,
+
+            UNIQUE (
+                client_id,
+                source_type,
+                source_value
+            )
+        )
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_client_sources_client_id
+        ON client_sources (client_id)
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_client_sources_type_value
+        ON client_sources (
+            source_type,
+            source_value
+        )
+        """
+    )
+
+def add_client_source(
+    *,
+    client_id: int,
+    source_type: str,
+    source_value: str,
+) -> None:
+    """
+    Сохранить источник, из которого был получен клиент.
+
+    Что делает:
+    - проверяет входные значения;
+    - создаёт связь клиента с источником;
+    - не создаёт дубль одинакового источника;
+    - при повторном обнаружении обновляет updated_at.
+
+    Аргументы:
+        client_id:
+            Внутренний ID клиента из таблицы clients.
+
+        source_type:
+            Тип источника, например:
+            - inn_file;
+            - manual_inn.
+
+        source_value:
+            Значение источника, например:
+            - имя файла;
+            - ИНН при ручном вводе.
+
+    Возвращает:
+        None.
+    """
+    if client_id < 1:
+        raise ValueError(
+            "client_id должен быть больше 0"
+        )
+
+    clean_source_type = source_type.strip()
+    clean_source_value = source_value.strip()
+
+    if not clean_source_type:
+        raise ValueError(
+            "source_type не может быть пустым"
+        )
+
+    if not clean_source_value:
+        raise ValueError(
+            "source_value не может быть пустым"
+        )
+
+    with get_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO client_sources (
+                client_id,
+                source_type,
+                source_value
+            )
+            VALUES (?, ?, ?)
+
+            ON CONFLICT(
+                client_id,
+                source_type,
+                source_value
+            )
+            DO UPDATE SET
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                client_id,
+                clean_source_type,
+                clean_source_value,
+            ),
+        )
 
 
 def initialize_mailing_tables(
@@ -2284,3 +2451,126 @@ def ensure_default_mail_campaign() -> int:
         )
 
     return campaign_id
+
+
+def upsert_client_by_inn_lookup(
+    *,
+    inn: str,
+    spp_uuid: str,
+) -> int:
+    """
+    Создать или обновить клиента, найденного через поиск по ИНН.
+
+    Используется для сценария, когда организация получена
+    не из пользовательской выборки СБИС, а через
+    Contractor.SearchSuggest.
+
+    Что делает:
+    - нормализует ИНН и SppUuid;
+    - сначала ищет клиента по SppUuid;
+    - если по SppUuid клиент не найден, ищет по точному ИНН;
+    - если клиент существует, обновляет его SppUuid и ИНН;
+    - если клиента нет, создаёт новую запись в clients;
+    - не создаёт связь в client_selections;
+    - не меняет enriched;
+    - возвращает внутренний clients.id.
+
+    Аргументы:
+        inn:
+            ИНН организации, состоящий из 10 или 12 цифр.
+
+        spp_uuid:
+            SppUuid организации, найденный через
+            Contractor.SearchSuggest.
+
+    Возвращает:
+        ID записи clients.
+
+    Исключения:
+        ValueError:
+            Если ИНН или SppUuid пустые либо некорректные.
+    """
+    clean_inn = "".join(
+        character
+        for character in inn
+        if character.isdigit()
+    )
+
+    if clean_inn != inn.strip() or len(clean_inn) not in (10, 12):
+        raise ValueError(
+            "ИНН должен содержать 10 или 12 цифр"
+        )
+
+    clean_spp_uuid = spp_uuid.strip()
+
+    if not clean_spp_uuid:
+        raise ValueError(
+            "spp_uuid не может быть пустым"
+        )
+
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT id
+            FROM clients
+            WHERE spp_uuid = ?
+            LIMIT 1
+            """,
+            (clean_spp_uuid,),
+        ).fetchone()
+
+        if row is None:
+            row = connection.execute(
+                """
+                SELECT id
+                FROM clients
+                WHERE inn = ?
+                ORDER BY id
+                LIMIT 1
+                """,
+                (clean_inn,),
+            ).fetchone()
+
+        if row is not None:
+            client_id = int(row["id"])
+
+            connection.execute(
+                """
+                UPDATE clients
+                SET
+                    spp_uuid = ?,
+                    inn = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    clean_spp_uuid,
+                    clean_inn,
+                    client_id,
+                ),
+            )
+
+            return client_id
+
+        cursor = connection.execute(
+            """
+            INSERT INTO clients (
+                spp_uuid,
+                inn
+            )
+            VALUES (?, ?)
+            """,
+            (
+                clean_spp_uuid,
+                clean_inn,
+            ),
+        )
+
+        client_id = cursor.lastrowid
+
+        if client_id is None:
+            raise RuntimeError(
+                "Не удалось создать запись клиента"
+            )
+
+        return int(client_id)
