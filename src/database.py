@@ -860,6 +860,8 @@ def initialize_mailing_tables(
 
             tracking_token TEXT,
 
+            is_test INTEGER NOT NULL DEFAULT 0,
+
             status TEXT NOT NULL DEFAULT 'pending',
 
             sent_at TEXT,
@@ -891,6 +893,13 @@ def initialize_mailing_tables(
             ADD COLUMN tracking_token TEXT
             """
         )
+    if "is_test" not in message_columns:
+            connection.execute(
+                """
+                ALTER TABLE mail_messages
+                ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0
+                """
+            )
 
     connection.execute(
         """
