@@ -636,23 +636,7 @@ async def run_sender(
             f"Тема: {message.subject}"
         )
 
-        print()
-        print(
-            "--- TEXT ---"
-        )
-
-        print(
-            message.text_body
-        )
-
-        print()
-        print(
-            "--- HTML ---"
-        )
-
-        print(
-            message.html_body
-        )
+        
 
         # ---------------------------------------------------------
         # DRY-RUN
