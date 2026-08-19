@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import html
 from textwrap import dedent
+from urllib.parse import quote
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +54,70 @@ SOFT_BACKGROUND = "#F7F9FA"
 BORDER = "#E8EAED"
 
 LOGO_CID = "atlantis-logo"
+
+TRACKING_BASE_URL = "https://mail.projectsbis.ru"
+
+CONTACT_PHONE_DISPLAY = "7‒952‒080‒22‒20"
+CONTACT_PHONE_URL = "tel:+79520802220"
+
+WHATSAPP_URL = (
+    "https://wa.me/79520802220"
+    "?text=Обращение+из+почты%0A"
+    "Здравствуйте!+Меня+заинтересовало+ваше+предложение"
+)
+TELEGRAM_URL = "https://t.me/+79520802220"
+MAX_URL = "https://max.ru/id614023297728_bot"
+
+EMAIL_URL = (
+    "mailto:info@projectsbis.ru"
+    "?subject=Подбор%20решения%20для%20онлайн-кассы"
+)
+
+
+def build_click_url(
+    *,
+    tracking_token: str | None,
+    click_key: str,
+    direct_url: str,
+) -> str:
+    """
+    Сформировать ссылку с click tracking.
+
+    Если tracking_token передан, получатель сначала открывает
+    наш endpoint вида:
+
+        /t/c/<tracking_token>/<click_key>
+
+    Tracking-сервис записывает событие перехода и затем делает
+    HTTP redirect на реальный адрес.
+
+    Если tracking_token отсутствует, возвращается исходная ссылка.
+    Это удобно для локального preview шаблона и писем без трекинга.
+
+    Аргументы:
+        tracking_token:
+            Токен конкретного mail_messages.
+
+        click_key:
+            Стабильный идентификатор ссылки:
+            cta_email, phone, whatsapp, telegram, max.
+
+        direct_url:
+            Реальный адрес назначения.
+
+    Возвращает:
+        Tracking URL либо исходный direct_url.
+    """
+    if not tracking_token:
+        return direct_url
+
+    safe_token = quote(tracking_token, safe="")
+    safe_key = quote(click_key, safe="")
+
+    return (
+        f"{TRACKING_BASE_URL}/t/c/"
+        f"{safe_token}/{safe_key}"
+    )
 
 
 def build_subject(
@@ -137,6 +202,12 @@ def build_text_body(
         Если предложение актуально, просто ответьте на это письмо —
         уточним задачу и предложим подходящий вариант.
 
+        Связаться с нами:
+        Телефон: 7-952-080-22-20
+        WhatsApp: https://wa.me/79520802220?text=Обращение+из+почты%0AЗдравствуйте!+Меня+заинтересовало+ваше+предложение
+        Telegram: https://t.me/+79520802220
+        MAX: https://max.ru/id614023297728_bot
+
         С уважением,
         Атлантис
         Автоматизация бизнеса
@@ -199,9 +270,41 @@ def build_html_body(
 
     if tracking_token:
         tracking_pixel_url = (
-            "https://mail.projectsbis.ru/t/o/"
+            f"{TRACKING_BASE_URL}/t/o/"
             f"{tracking_token}.gif"
         )
+
+    cta_email_url = build_click_url(
+        tracking_token=tracking_token,
+        click_key="cta_email",
+        direct_url=EMAIL_URL,
+    )
+    phone_url = build_click_url(
+        tracking_token=tracking_token,
+        click_key="phone",
+        direct_url=CONTACT_PHONE_URL,
+    )
+    whatsapp_url = build_click_url(
+        tracking_token=tracking_token,
+        click_key="whatsapp",
+        direct_url=WHATSAPP_URL,
+    )
+    telegram_url = build_click_url(
+        tracking_token=tracking_token,
+        click_key="telegram",
+        direct_url=TELEGRAM_URL,
+    )
+    max_url = build_click_url(
+        tracking_token=tracking_token,
+        click_key="max",
+        direct_url=MAX_URL,
+    )
+
+    safe_cta_email_url = html.escape(cta_email_url, quote=True)
+    safe_phone_url = html.escape(phone_url, quote=True)
+    safe_whatsapp_url = html.escape(whatsapp_url, quote=True)
+    safe_telegram_url = html.escape(telegram_url, quote=True)
+    safe_max_url = html.escape(max_url, quote=True)
 
     return dedent(
         f"""
@@ -581,7 +684,7 @@ def build_html_body(
                                             >
 
                                                 <a
-                                                    href="mailto:info@projectsbis.ru?subject=Подбор%20решения%20для%20онлайн-кассы"
+                                                    href="{safe_cta_email_url}"
                                                     style="
                                                         display: inline-block;
                                                         padding:
@@ -603,6 +706,92 @@ def build_html_body(
                                         </tr>
                                     </table>
 
+
+
+                                    <!-- =================================================
+                                         CONTACTS / TRACKED LINKS
+                                         ================================================= -->
+                                    <table
+                                        role="presentation"
+                                        width="100%"
+                                        cellspacing="0"
+                                        cellpadding="0"
+                                        border="0"
+                                        style="
+                                            width: 100%;
+                                            margin-top: 24px;
+                                            background-color: {SOFT_BACKGROUND};
+                                            border-radius: 10px;
+                                        "
+                                    >
+                                        <tr>
+                                            <td
+                                                style="
+                                                    padding: 20px 24px;
+                                                "
+                                            >
+                                                <div
+                                                    style="
+                                                        margin-bottom: 12px;
+                                                        font-size: 15px;
+                                                        line-height: 1.4;
+                                                        font-weight: 700;
+                                                        color: {TEXT_PRIMARY};
+                                                    "
+                                                >
+                                                    Связаться с нами
+                                                </div>
+
+                                                <div
+                                                    style="
+                                                        font-size: 14px;
+                                                        line-height: 1.9;
+                                                    "
+                                                >
+                                                    <a
+                                                        href="{safe_phone_url}"
+                                                        style="
+                                                            color: {BRAND_CYAN};
+                                                            text-decoration: none;
+                                                            font-weight: 700;
+                                                        "
+                                                    >
+                                                        {CONTACT_PHONE_DISPLAY}
+                                                    </a>
+                                                    &nbsp;&nbsp;·&nbsp;&nbsp;
+                                                    <a
+                                                        href="{safe_whatsapp_url}"
+                                                        style="
+                                                            color: {BRAND_CYAN};
+                                                            text-decoration: none;
+                                                        "
+                                                    >
+                                                        WhatsApp
+                                                    </a>
+                                                    &nbsp;&nbsp;·&nbsp;&nbsp;
+                                                    <a
+                                                        href="{safe_telegram_url}"
+                                                        style="
+                                                            color: {BRAND_CYAN};
+                                                            text-decoration: none;
+                                                        "
+                                                    >
+                                                        Telegram
+                                                    </a>
+                                                    &nbsp;&nbsp;·&nbsp;&nbsp;
+                                                    <a
+                                                        href="{safe_max_url}"
+                                                        style="
+                                                            color: {BRAND_CYAN};
+                                                            text-decoration: none;
+                                                        "
+                                                    >
+                                                        MAX
+                                                    </a>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    </table>
 
                                     <!-- Низкий барьер -->
                                     <div
@@ -693,9 +882,19 @@ def build_html_body(
                                         style="
                                             margin-top: 10px;
                                             font-size: 12px;
-                                            line-height: 1.5;
+                                            line-height: 1.8;
                                         "
                                     >
+                                        <a
+                                            href="{safe_phone_url}"
+                                            style="
+                                                color: {BRAND_CYAN};
+                                                text-decoration: none;
+                                            "
+                                        >
+                                            {CONTACT_PHONE_DISPLAY}
+                                        </a>
+                                        <br>
                                         <a
                                             href="mailto:info@projectsbis.ru"
                                             style="

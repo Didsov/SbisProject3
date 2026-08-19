@@ -16,7 +16,7 @@ Tracking token является непрозрачным случайным ид
 
 from __future__ import annotations
 from aiohttp import web
-from src.database import record_mail_open
+from src.database import record_mail_click, record_mail_open
 
 
 TRANSPARENT_GIF = (
@@ -29,6 +29,93 @@ TRANSPARENT_GIF = (
     b",\x00\x00\x00\x00\x01\x00\x01\x00"
     b"\x00\x02\x02D\x01\x00;"
 )
+
+
+CLICK_TARGETS = {
+    "cta_email": (
+        "mailto:info@projectsbis.ru"
+        "?subject=Подбор%20решения%20для%20онлайн-кассы"
+    ),
+    "phone": "tel:+79520802220",
+    "whatsapp": (
+        "https://wa.me/79520802220"
+        "?text=Обращение+из+почты%0A"
+        "Здравствуйте!+Меня+заинтересовало+ваше+предложение"
+    ),
+    "telegram": "https://t.me/+79520802220",
+    "max": "https://max.ru/id614023297728_bot",
+}
+
+
+def process_click_tracking(
+    tracking_token: str,
+    click_key: str,
+) -> str | None:
+    """
+    Обработать переход по отслеживаемой ссылке.
+
+    Что делает:
+    - проверяет, что click_key относится к разрешённой ссылке;
+    - сохраняет событие `clicked` для tracking_token;
+    - возвращает реальный URL назначения.
+
+    Аргументы:
+        tracking_token:
+            Token конкретного письма.
+
+        click_key:
+            Стабильный идентификатор ссылки:
+            cta_email, phone, whatsapp, telegram или max.
+
+    Возвращает:
+        Реальный URL назначения либо None,
+        если click_key неизвестен.
+
+    Примечание:
+        Реальный URL не принимается из пользовательского запроса.
+        Это защищает endpoint от превращения в открытый redirect.
+    """
+    target_url = CLICK_TARGETS.get(click_key)
+
+    if target_url is None:
+        return None
+
+    record_mail_click(
+        tracking_token=tracking_token,
+        click_key=click_key,
+    )
+
+    return target_url
+
+
+async def handle_click_tracking(
+    request: web.Request,
+) -> web.Response:
+    """
+    Обработать переход по tracked-ссылке.
+
+    URL:
+        GET /t/c/{tracking_token}/{click_key}
+
+    Что делает:
+    - извлекает tracking_token и click_key из URL;
+    - сохраняет событие clicked;
+    - перенаправляет пользователя на настоящий адрес.
+
+    Неизвестный click_key возвращает 404.
+    """
+    tracking_token = request.match_info["tracking_token"]
+    click_key = request.match_info["click_key"]
+
+    target_url = process_click_tracking(
+        tracking_token=tracking_token,
+        click_key=click_key,
+    )
+
+    if target_url is None:
+        raise web.HTTPNotFound()
+
+    raise web.HTTPFound(location=target_url)
 
 
 def process_open_tracking(
@@ -105,10 +192,12 @@ def create_app() -> web.Application:
 
     Что делает:
     - создаёт HTTP-приложение;
-    - регистрирует endpoint открытия письма.
+    - регистрирует endpoint открытия письма;
+    - регистрирует endpoint переходов по ссылкам.
 
     Маршруты:
         GET /t/o/{tracking_token}.gif
+        GET /t/c/{tracking_token}/{click_key}
 
     Возвращает:
         Настроенный web.Application.
@@ -118,6 +207,11 @@ def create_app() -> web.Application:
     app.router.add_get(
         "/t/o/{tracking_token}.gif",
         handle_open_tracking,
+    )
+
+    app.router.add_get(
+        "/t/c/{tracking_token}/{click_key}",
+        handle_click_tracking,
     )
 
     return app

@@ -22,6 +22,7 @@
 """
 
 from __future__ import annotations
+import json
 import os
 import sqlite3
 from pathlib import Path
@@ -2403,6 +2404,96 @@ def record_mail_open(
             (
                 message["id"],
                 "opened",
+            ),
+        )
+
+        return True
+
+
+def record_mail_click(
+    *,
+    tracking_token: str,
+    click_key: str,
+) -> bool:
+    """
+    Зафиксировать переход по ссылке из письма.
+
+    Что делает:
+    - принимает tracking_token конкретного mail_messages;
+    - принимает стабильный идентификатор ссылки click_key;
+    - ищет письмо по tracking_token;
+    - сохраняет событие `clicked` в mail_events;
+    - помещает click_key в event_data как JSON;
+    - неизвестный или пустой token не приводит к ошибке.
+
+    Аргументы:
+        tracking_token:
+            Уникальный tracking token из mail_messages.
+
+        click_key:
+            Стабильный идентификатор ссылки, например:
+            - cta_email;
+            - phone;
+            - whatsapp;
+            - telegram;
+            - max.
+
+    Возвращает:
+        True:
+            Письмо найдено и событие `clicked` записано.
+
+        False:
+            tracking_token или click_key пустой,
+            либо письмо по token не найдено.
+
+    Формат event_data:
+        {"click_key": "whatsapp"}
+
+    Примечание:
+        Каждый фактический HTTP-переход сохраняется отдельным событием.
+        Уникальный клик позже считается аналитическим запросом
+        как наличие хотя бы одного события clicked для message_id.
+    """
+    token = tracking_token.strip()
+    clean_click_key = click_key.strip()
+
+    if not token or not clean_click_key:
+        return False
+
+    event_data = json.dumps(
+        {
+            "click_key": clean_click_key,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+    with get_connection() as connection:
+        message = connection.execute(
+            """
+            SELECT id
+            FROM mail_messages
+            WHERE tracking_token = ?
+            """,
+            (token,),
+        ).fetchone()
+
+        if message is None:
+            return False
+
+        connection.execute(
+            """
+            INSERT INTO mail_events (
+                message_id,
+                event_type,
+                event_data
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                message["id"],
+                "clicked",
+                event_data,
             ),
         )
 
