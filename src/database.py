@@ -1363,6 +1363,21 @@ def populate_mail_recipients(
                 AND cc.contact_type = 'email'
                 AND cc.value IS NOT NULL
                 AND TRIM(cc.value) <> ''
+
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM mail_recipients AS old_mr
+
+                    INNER JOIN mail_messages AS old_mm
+                        ON old_mm.recipient_id = old_mr.id
+
+                    WHERE
+                        LOWER(TRIM(old_mr.email))
+                            = LOWER(TRIM(cc.value))
+
+                        AND old_mm.status = 'sent'
+                        AND old_mm.is_test = 0
+                )
             """,
             (
                 campaign_id,
