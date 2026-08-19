@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from uuid import uuid4
+from src.config import TEST_MAIL_EMAIL
 
 from src.mailing.smtp_provider import SMTPMailProvider
 
@@ -215,6 +216,15 @@ def parse_arguments() -> argparse.Namespace:
             "а не реальным получателям кампании."
         ),
     )
+    parser.add_argument(
+        "--tracking-test",
+        action="store_true",
+        help=(
+            "Отправить полноценное тестовое письмо "
+            "с tracking_token на TEST_MAIL_EMAIL. "
+            "Статус реального получателя не изменяется."
+        ),
+    )
 
     arguments = parser.parse_args()
     if (
@@ -243,13 +253,15 @@ def parse_arguments() -> argparse.Namespace:
             arguments.dry_run,
             arguments.mock_send,
             arguments.smtp_send,
+            arguments.tracking_test,
         ]
     )
 
     if selected_modes != 1:
         parser.error(
             "Нужно указать ровно один режим: "
-            "--dry-run, --mock-send или --smtp-send"
+            "--dry-run, --mock-send, --smtp-send "
+            "или --tracking-test"
         )
 
     return arguments
@@ -424,6 +436,7 @@ async def run_sender(
     mock_send: bool,
     smtp_send: bool,
     test_emails: list[str],
+    tracking_test: bool,
 ) -> None:
     """
     Обработать очередь получателей почтовой кампании.
@@ -487,6 +500,17 @@ async def run_sender(
     Возвращает:
         None.
     """
+    if tracking_test and not TEST_MAIL_EMAIL:
+        raise RuntimeError(
+            "Для --tracking-test не задан TEST_MAIL_EMAIL"
+        )
+    if tracking_test:
+        print(
+            f"Tracking-test будет отправлен на: "
+            f"{TEST_MAIL_EMAIL}"
+        )
+
+    
     campaign = get_mail_campaign(
         campaign_id
     )
@@ -519,7 +543,7 @@ async def run_sender(
         )
         return
 
-    if smtp_send:
+    if smtp_send or tracking_test:
         provider = SMTPMailProvider.from_env()
     else:
         provider = MockMailProvider()
@@ -562,13 +586,14 @@ async def run_sender(
         else:
             provider_name = (
                 "smtp"
-                if smtp_send
+                if smtp_send or tracking_test
                 else "mock"
             )
 
             mail_message_record = create_mail_message(
                 recipient_id=recipient["recipient_id"],
                 provider=provider_name,
+                is_test=tracking_test,
             )
 
             message_id = mail_message_record[
@@ -584,6 +609,15 @@ async def run_sender(
                 template,
                 tracking_token=tracking_token,
             )
+            if tracking_test:
+                message.to_email = TEST_MAIL_EMAIL
+
+
+
+
+        if tracking_test:
+            message.to_email = TEST_MAIL_EMAIL
+            message.subject = f"[TRACKING TEST] {message.subject}"
 
         # ---------------------------------------------------------
         # ОБЩИЙ ВЫВОД СФОРМИРОВАННОГО ПИСЬМА
@@ -727,7 +761,7 @@ async def run_sender(
 
         result_title = (
             "--- SMTP RESULT ---"
-            if smtp_send
+            if smtp_send or tracking_test
             else "--- MOCK RESULT ---"
         )
 
@@ -800,6 +834,23 @@ async def run_sender(
         print(
             "Статусы реальных получателей не изменены."
         )
+    elif tracking_test:
+        print(
+            "Tracking-test завершён."
+        )
+
+        print(
+            f"Письмо отправлено на: {TEST_MAIL_EMAIL}"
+        )
+
+        print(
+            "Тестовая попытка сохранена в mail_messages "
+            "с is_test=1."
+        )
+
+        print(
+            "Статус реального получателя не изменён."
+        )
 
     elif smtp_send:
         print(
@@ -839,6 +890,7 @@ def main() -> None:
             mock_send=arguments.mock_send,
             smtp_send=arguments.smtp_send,
             test_emails=test_emails,
+            tracking_test=arguments.tracking_test,
         )
     )
 

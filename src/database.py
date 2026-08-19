@@ -1580,95 +1580,7 @@ def create_mail_message(
     *,
     recipient_id: int,
     provider: str,
-    provider_message_id: str | None,
-    status: str,
-) -> int:
-    """
-    Создать запись о попытке отправки письма.
-
-    Аргументы:
-        recipient_id:
-            ID получателя из mail_recipients.
-
-        provider:
-            Имя почтового провайдера, например:
-            - mock;
-            - mailgun;
-            - resend.
-
-        provider_message_id:
-            Идентификатор сообщения у провайдера.
-            Может быть None при ошибке отправки.
-
-        status:
-            Статус сообщения, например:
-            - sent;
-            - failed.
-
-    Возвращает:
-        ID созданной записи mail_messages.
-
-    Исключения:
-        ValueError:
-            Если recipient_id меньше 1;
-            если provider или status пустые.
-    """
-    if recipient_id < 1:
-        raise ValueError(
-            "recipient_id должен быть больше 0"
-        )
-
-    provider_name = provider.strip()
-
-    if not provider_name:
-        raise ValueError(
-            "provider не может быть пустым"
-        )
-
-    message_status = status.strip()
-
-    if not message_status:
-        raise ValueError(
-            "status не может быть пустым"
-        )
-
-    with get_connection() as connection:
-        cursor = connection.execute(
-            """
-            INSERT INTO mail_messages (
-                recipient_id,
-                provider,
-                provider_message_id,
-                status,
-                sent_at
-            )
-            VALUES (
-                ?,
-                ?,
-                ?,
-                ?,
-                CASE
-                    WHEN ? = 'sent'
-                    THEN CURRENT_TIMESTAMP
-                    ELSE NULL
-                END
-            )
-            """,
-            (
-                recipient_id,
-                provider_name,
-                provider_message_id,
-                message_status,
-                message_status,
-            ),
-        )
-
-        return cursor.lastrowid
-
-def create_mail_message(
-    *,
-    recipient_id: int,
-    provider: str,
+    is_test: bool = False,
 ) -> dict:
     """
     Создать попытку отправки письма до обращения к SMTP.
@@ -1686,6 +1598,10 @@ def create_mail_message(
 
         provider:
             Имя почтового провайдера, например "smtp" или "mock".
+
+        is_test:
+    Признак тестовой учётной попытки.
+    True сохраняется как 1, False как 0.
 
     Возвращает:
         Словарь:
@@ -1748,14 +1664,16 @@ def create_mail_message(
                 recipient_id,
                 provider,
                 status,
-                tracking_token
+                tracking_token,
+                is_test
             )
-            VALUES (?, ?, 'pending', ?)
+            VALUES (?, ?, 'pending', ?, ?)
             """,
             (
                 recipient_id,
                 clean_provider,
                 tracking_token,
+                int(is_test),
             ),
         )
 
@@ -1780,15 +1698,14 @@ def complete_mail_message(
     error: str | None = None,
 ) -> None:
     """
-    Завершить ранее созданную попытку отправки.
-
-    Что делает:
-    - находит существующую запись mail_messages;
-    - меняет её статус на sent или failed;
-    - сохраняет provider_message_id;
-    - при успехе устанавливает sent_at;
-    - обновляет статус mail_recipients;
-    - создаёт событие sent или failed в mail_events.
+Что делает:
+- находит существующую запись mail_messages;
+- меняет её статус на sent или failed;
+- сохраняет provider_message_id;
+- при успехе устанавливает sent_at;
+- для обычной отправки обновляет статус mail_recipients;
+- для is_test=1 статус реального mail_recipients не изменяет;
+- создаёт событие sent или failed в mail_events.
 
     Аргументы:
         message_id:
@@ -1833,7 +1750,8 @@ def complete_mail_message(
             SELECT
                 id,
                 recipient_id,
-                status
+                status,
+                is_test
             FROM mail_messages
             WHERE id = ?
             """,
@@ -1853,6 +1771,9 @@ def complete_mail_message(
 
         recipient_id = int(
             message["recipient_id"]
+        )
+        is_test = bool(
+            message["is_test"]
         )
 
         if success:
@@ -1887,19 +1808,20 @@ def complete_mail_message(
                 ),
             )
 
-        connection.execute(
-            """
-            UPDATE mail_recipients
-            SET
-                status = ?,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
-            (
-                message_status,
-                recipient_id,
-            ),
-        )
+        if not is_test:
+            connection.execute(
+                """
+                UPDATE mail_recipients
+                SET
+                    status = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    message_status,
+                    recipient_id,
+                ),
+            )
 
         connection.execute(
             """
