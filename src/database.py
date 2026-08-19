@@ -50,7 +50,7 @@ def get_connection() -> sqlite3.Connection:
         Закрывать соединение должен вызывающий код,
         обычно через конструкцию with.
     """
-    DATABASE_DIR.mkdir(
+    DATABASE_FILE.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
