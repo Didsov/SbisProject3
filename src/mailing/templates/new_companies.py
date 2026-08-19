@@ -727,12 +727,13 @@ def build_html_body(
                                         <tr>
                                             <td
                                                 style="
-                                                    padding: 20px 24px;
+                                                    padding: 20px 24px 22px 24px;
                                                 "
                                             >
+                                                <!-- Заголовок блока -->
                                                 <div
                                                     style="
-                                                        margin-bottom: 12px;
+                                                        margin: 0;
                                                         font-size: 15px;
                                                         line-height: 1.4;
                                                         font-weight: 700;
@@ -742,52 +743,244 @@ def build_html_body(
                                                     Связаться с нами
                                                 </div>
 
-                                                <div
+                                                <!-- Телефон: отдельная усиленная строка -->
+                                                <table
+                                                    role="presentation"
+                                                    cellspacing="0"
+                                                    cellpadding="0"
+                                                    border="0"
                                                     style="
-                                                        font-size: 14px;
-                                                        line-height: 1.9;
+                                                        margin-top: 12px;
                                                     "
                                                 >
-                                                    <a
-                                                        href="{safe_phone_url}"
+                                                    <tr>
+                                                        <td
+                                                            valign="middle"
+                                                            style="
+                                                                width: 28px;
+                                                                height: 28px;
+                                                                text-align: center;
+                                                                vertical-align: middle;
+                                                                background-color: #E8F8FA;
+                                                                border-radius: 7px;
+                                                                font-size: 16px;
+                                                                line-height: 28px;
+                                                                color: {BRAND_CYAN};
+                                                            "
+                                                        >
+                                                            &#9742;
+                                                        </td>
+
+                                                        <td
+                                                            valign="middle"
+                                                            style="
+                                                                padding-left: 9px;
+                                                            "
+                                                        >
+                                                            <a
+                                                                href="{safe_phone_url}"
+                                                                style="
+                                                                    display: inline-block;
+                                                                    color: {TEXT_PRIMARY};
+                                                                    text-decoration: none;
+                                                                    font-size: 16px;
+                                                                    line-height: 1.4;
+                                                                    font-weight: 700;
+                                                                "
+                                                            >
+                                                                {CONTACT_PHONE_DISPLAY}
+                                                            </a>
+                                                        </td>
+                                                    </tr>
+                                                </table>
+
+                                                <!-- Подпись -->
+                                                <div
+                                                    style="
+                                                        margin-top: 13px;
+                                                        margin-bottom: 9px;
+                                                        font-size: 12px;
+                                                        line-height: 1.45;
+                                                        color: {TEXT_SECONDARY};
+                                                    "
+                                                >
+                                                    Выберите удобный мессенджер
+                                                </div>
+
+                                                <!--
+                                                    Email-safe кнопки.
+
+                                                    Используются отдельные inline-table,
+                                                    поэтому на узком экране клиенты,
+                                                    допускающие перенос inline-block,
+                                                    смогут перенести кнопку целиком
+                                                    на следующую строку без горизонтального скролла.
+                                                -->
+                                                <div
+                                                    style="
+                                                        font-size: 0;
+                                                        line-height: 0;
+                                                    "
+                                                >
+                                                    <!-- WhatsApp -->
+                                                    <table
+                                                        role="presentation"
+                                                        cellspacing="0"
+                                                        cellpadding="0"
+                                                        border="0"
                                                         style="
-                                                            color: {BRAND_CYAN};
-                                                            text-decoration: none;
-                                                            font-weight: 700;
+                                                            display: inline-table;
+                                                            margin: 0 8px 8px 0;
+                                                            vertical-align: top;
                                                         "
                                                     >
-                                                        {CONTACT_PHONE_DISPLAY}
-                                                    </a>
-                                                    &nbsp;&nbsp;·&nbsp;&nbsp;
-                                                    <a
-                                                        href="{safe_whatsapp_url}"
+                                                        <tr>
+                                                            <td
+                                                                style="
+                                                                    height: 40px;
+                                                                    background-color: #FFFFFF;
+                                                                    border: 1px solid #E2E6E8;
+                                                                    border-radius: 8px;
+                                                                "
+                                                            >
+                                                                <a
+                                                                    href="{safe_whatsapp_url}"
+                                                                    style="
+                                                                        display: block;
+                                                                        padding: 10px 14px;
+                                                                        color: {TEXT_PRIMARY};
+                                                                        text-decoration: none;
+                                                                        font-size: 14px;
+                                                                        line-height: 18px;
+                                                                        font-weight: 600;
+                                                                        white-space: nowrap;
+                                                                    "
+                                                                >
+                                                                    <span
+                                                                        style="
+                                                                            display: inline-block;
+                                                                            width: 18px;
+                                                                            height: 18px;
+                                                                            margin-right: 7px;
+                                                                            border-radius: 50%;
+                                                                            background-color: #E8F8FA;
+                                                                            color: {BRAND_CYAN};
+                                                                            font-size: 13px;
+                                                                            line-height: 18px;
+                                                                            text-align: center;
+                                                                            vertical-align: -1px;
+                                                                        "
+                                                                    >&#9742;</span>WhatsApp
+                                                                </a>
+                                                            </td>
+                                                        </tr>
+                                                    </table>
+
+                                                    <!-- Telegram -->
+                                                    <table
+                                                        role="presentation"
+                                                        cellspacing="0"
+                                                        cellpadding="0"
+                                                        border="0"
                                                         style="
-                                                            color: {BRAND_CYAN};
-                                                            text-decoration: none;
+                                                            display: inline-table;
+                                                            margin: 0 8px 8px 0;
+                                                            vertical-align: top;
                                                         "
                                                     >
-                                                        WhatsApp
-                                                    </a>
-                                                    &nbsp;&nbsp;·&nbsp;&nbsp;
-                                                    <a
-                                                        href="{safe_telegram_url}"
+                                                        <tr>
+                                                            <td
+                                                                style="
+                                                                    height: 40px;
+                                                                    background-color: #FFFFFF;
+                                                                    border: 1px solid #E2E6E8;
+                                                                    border-radius: 8px;
+                                                                "
+                                                            >
+                                                                <a
+                                                                    href="{safe_telegram_url}"
+                                                                    style="
+                                                                        display: block;
+                                                                        padding: 10px 14px;
+                                                                        color: {TEXT_PRIMARY};
+                                                                        text-decoration: none;
+                                                                        font-size: 14px;
+                                                                        line-height: 18px;
+                                                                        font-weight: 600;
+                                                                        white-space: nowrap;
+                                                                    "
+                                                                >
+                                                                    <span
+                                                                        style="
+                                                                            display: inline-block;
+                                                                            width: 18px;
+                                                                            margin-right: 7px;
+                                                                            color: {BRAND_CYAN};
+                                                                            font-size: 17px;
+                                                                            line-height: 18px;
+                                                                            text-align: center;
+                                                                            vertical-align: -1px;
+                                                                        "
+                                                                    >&#10148;</span>Telegram
+                                                                </a>
+                                                            </td>
+                                                        </tr>
+                                                    </table>
+
+                                                    <!-- MAX -->
+                                                    <table
+                                                        role="presentation"
+                                                        cellspacing="0"
+                                                        cellpadding="0"
+                                                        border="0"
                                                         style="
-                                                            color: {BRAND_CYAN};
-                                                            text-decoration: none;
+                                                            display: inline-table;
+                                                            margin: 0 0 8px 0;
+                                                            vertical-align: top;
                                                         "
                                                     >
-                                                        Telegram
-                                                    </a>
-                                                    &nbsp;&nbsp;·&nbsp;&nbsp;
-                                                    <a
-                                                        href="{safe_max_url}"
-                                                        style="
-                                                            color: {BRAND_CYAN};
-                                                            text-decoration: none;
-                                                        "
-                                                    >
-                                                        MAX
-                                                    </a>
+                                                        <tr>
+                                                            <td
+                                                                style="
+                                                                    height: 40px;
+                                                                    background-color: #FFFFFF;
+                                                                    border: 1px solid #E2E6E8;
+                                                                    border-radius: 8px;
+                                                                "
+                                                            >
+                                                                <a
+                                                                    href="{safe_max_url}"
+                                                                    style="
+                                                                        display: block;
+                                                                        padding: 10px 14px;
+                                                                        color: {TEXT_PRIMARY};
+                                                                        text-decoration: none;
+                                                                        font-size: 14px;
+                                                                        line-height: 18px;
+                                                                        font-weight: 600;
+                                                                        white-space: nowrap;
+                                                                    "
+                                                                >
+                                                                    <span
+                                                                        style="
+                                                                            display: inline-block;
+                                                                            width: 18px;
+                                                                            height: 18px;
+                                                                            margin-right: 7px;
+                                                                            border-radius: 50%;
+                                                                            background-color: #E8F8FA;
+                                                                            color: {BRAND_CYAN};
+                                                                            font-size: 11px;
+                                                                            line-height: 18px;
+                                                                            font-weight: 700;
+                                                                            text-align: center;
+                                                                            vertical-align: -1px;
+                                                                        "
+                                                                    >M</span>MAX
+                                                                </a>
+                                                            </td>
+                                                        </tr>
+                                                    </table>
                                                 </div>
                                             </td>
                                         </tr>
