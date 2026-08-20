@@ -22,6 +22,8 @@
 """
 
 from __future__ import annotations
+
+from contextlib import closing
 import json
 import os
 import sqlite3
@@ -2393,6 +2395,234 @@ def get_mail_run_message_counts(
         for field_name in MAIL_RUN_COUNTER_FIELDS
         if field_name != "recipients_added"
     }
+
+
+def get_recent_mail_runs(
+    limit: int = 50,
+) -> list[dict[str, object]]:
+    """Получить последние запуски рассылки для списка будущей админки."""
+    if limit < 1:
+        raise ValueError(
+            "limit должен быть больше 0"
+        )
+
+    with closing(get_connection()) as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                mr.id AS run_id,
+                mr.campaign_id,
+                mc.name AS campaign_name,
+                mr.selection_id,
+                mr.trigger,
+                mr.status,
+                mr.started_at,
+                mr.finished_at,
+                mr.recipients_added,
+                mr.sent_count,
+                mr.delivered_count,
+                mr.bounced_count,
+                mr.deferred_count,
+                mr.failed_count
+            FROM mail_runs AS mr
+
+            INNER JOIN mail_campaigns AS mc
+                ON mc.id = mr.campaign_id
+
+            ORDER BY
+                mr.started_at DESC,
+                mr.id DESC
+
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    return [
+        dict(row)
+        for row in rows
+    ]
+
+
+def get_mail_run_details(
+    run_id: int,
+) -> dict[str, object]:
+    """Получить сводные данные одного запуска рассылки."""
+    if run_id < 1:
+        raise ValueError(
+            "run_id должен быть больше 0"
+        )
+
+    with closing(get_connection()) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                mr.id AS run_id,
+                mr.campaign_id,
+                mc.name AS campaign_name,
+                mr.selection_id,
+                mr.trigger,
+                mr.status,
+                mr.started_at,
+                mr.finished_at,
+                mr.recipients_added,
+                mr.sent_count,
+                mr.delivered_count,
+                mr.bounced_count,
+                mr.deferred_count,
+                mr.failed_count,
+                mr.error_text
+            FROM mail_runs AS mr
+
+            INNER JOIN mail_campaigns AS mc
+                ON mc.id = mr.campaign_id
+
+            WHERE mr.id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+
+    if row is None:
+        raise LookupError(
+            f"mail_runs #{run_id} не найден"
+        )
+
+    return dict(row)
+
+
+def get_mail_run_messages(
+    run_id: int,
+    *,
+    include_test: bool = False,
+) -> list[dict[str, object]]:
+    """Получить сообщения запуска с агрегатами открытий и кликов."""
+    if run_id < 1:
+        raise ValueError(
+            "run_id должен быть больше 0"
+        )
+
+    with closing(get_connection()) as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                mm.id AS message_id,
+                c.name AS company_name,
+                mr.email,
+                mm.status AS send_status,
+                mm.delivery_status,
+                mm.sent_at,
+                SUM(
+                    CASE
+                        WHEN me.event_type = 'opened'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS opened_count,
+                SUM(
+                    CASE
+                        WHEN me.event_type = 'clicked'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS clicked_count,
+                MAX(me.event_at) AS last_event_at
+            FROM mail_messages AS mm
+
+            INNER JOIN mail_recipients AS mr
+                ON mr.id = mm.recipient_id
+
+            INNER JOIN clients AS c
+                ON c.id = mr.client_id
+
+            LEFT JOIN mail_events AS me
+                ON me.message_id = mm.id
+
+            WHERE
+                mm.run_id = ?
+                AND (? = 1 OR mm.is_test = 0)
+
+            GROUP BY
+                mm.id,
+                c.name,
+                mr.email,
+                mm.status,
+                mm.delivery_status,
+                mm.sent_at
+
+            ORDER BY mm.id
+            """,
+            (
+                run_id,
+                int(include_test),
+            ),
+        ).fetchall()
+
+    messages: list[dict[str, object]] = []
+
+    for row in rows:
+        message = dict(row)
+        message["opened_count"] = int(
+            message["opened_count"] or 0
+        )
+        message["clicked_count"] = int(
+            message["clicked_count"] or 0
+        )
+        messages.append(message)
+
+    return messages
+
+
+def get_mail_run_events(
+    run_id: int,
+    *,
+    include_test: bool = False,
+) -> list[dict[str, object]]:
+    """Получить хронологию событий сообщений одного запуска."""
+    if run_id < 1:
+        raise ValueError(
+            "run_id должен быть больше 0"
+        )
+
+    with closing(get_connection()) as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                me.id AS event_id,
+                me.message_id,
+                c.name AS company_name,
+                mr.email,
+                me.event_type,
+                me.event_at,
+                me.event_data
+            FROM mail_events AS me
+
+            INNER JOIN mail_messages AS mm
+                ON mm.id = me.message_id
+
+            INNER JOIN mail_recipients AS mr
+                ON mr.id = mm.recipient_id
+
+            INNER JOIN clients AS c
+                ON c.id = mr.client_id
+
+            WHERE
+                mm.run_id = ?
+                AND (? = 1 OR mm.is_test = 0)
+
+            ORDER BY
+                me.event_at,
+                me.id
+            """,
+            (
+                run_id,
+                int(include_test),
+            ),
+        ).fetchall()
+
+    return [
+        dict(row)
+        for row in rows
+    ]
 
 
 
