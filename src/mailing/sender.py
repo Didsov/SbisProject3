@@ -593,7 +593,7 @@ async def run_sender(
             mail_message_record = create_mail_message(
                 recipient_id=recipient["recipient_id"],
                 provider=provider_name,
-                is_test=tracking_test,
+                is_test=(tracking_test or not smtp_send),
             )
 
             message_id = mail_message_record[

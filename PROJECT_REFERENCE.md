@@ -826,6 +826,15 @@ python -m src.sql_export `
     --param selection_id=5984
 ```
 
+Экспорт выборки по списку инн :
+
+```powershell
+python -m src.sql_export `
+    --query source_full_clients `
+    --param source_type=manual_inn `
+    --param source_value=251118147906`
+```
+
 Запуск внешнего SQL и собственный путь:
 
 ```powershell

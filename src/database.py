@@ -2670,6 +2670,125 @@ def record_mail_click(
 
         return True
 
+def record_mail_delivery_status(
+    *,
+    provider_message_id: str,
+    delivery_status: str,
+    queue_id: str | None = None,
+    dsn: str | None = None,
+    detail: str | None = None,
+) -> bool:
+    """
+    Зафиксировать результат доставки письма по данным Postfix.
+
+    Поддерживаемые статусы:
+    - delivered — удалённый SMTP-сервер принял письмо;
+    - deferred — временная ошибка доставки;
+    - bounced — окончательный отказ в доставке.
+
+    Функция:
+    - ищет mail_messages по provider_message_id;
+    - не обрабатывает тестовые сообщения;
+    - обновляет только mail_messages.status;
+    - mail_recipients.status не изменяет;
+    - сохраняет событие в mail_events;
+    - повторная запись того же статуса не создаёт дубль события.
+
+    Возвращает:
+        True — письмо найдено;
+        False — письмо не найдено или является тестовым.
+    """
+    message_id_value = provider_message_id.strip()
+
+    if not message_id_value:
+        return False
+
+    allowed_statuses = {
+        "delivered",
+        "deferred",
+        "bounced",
+    }
+
+    if delivery_status not in allowed_statuses:
+        raise ValueError(
+            f"Неизвестный delivery_status: {delivery_status!r}"
+        )
+
+    event_data = json.dumps(
+        {
+            "queue_id": queue_id,
+            "dsn": dsn,
+            "detail": detail,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+    with get_connection() as connection:
+        message = connection.execute(
+            """
+            SELECT
+                id,
+                status,
+                is_test
+            FROM mail_messages
+            WHERE provider_message_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (message_id_value,),
+        ).fetchone()
+
+        if message is None:
+            return False
+
+        if message["is_test"]:
+            return False
+
+        # delivered и bounced являются финальными состояниями.
+        # Повторный проход по mail.log не должен откатывать их назад.
+        if message["status"] in {
+            "delivered",
+            "bounced",
+        }:
+            return True
+
+        # Если этот статус уже был записан, повторное сканирование
+        # логов не должно создавать дополнительное событие.
+        if message["status"] == delivery_status:
+            return True
+
+        connection.execute(
+            """
+            UPDATE mail_messages
+            SET status = ?
+            WHERE id = ?
+            """,
+            (
+                delivery_status,
+                message["id"],
+            ),
+        )
+
+        connection.execute(
+            """
+            INSERT INTO mail_events (
+                message_id,
+                event_type,
+                event_data
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                message["id"],
+                delivery_status,
+                event_data,
+            ),
+        )
+
+        return True
+
+
 
 def ensure_default_mail_campaign() -> int:
     """
