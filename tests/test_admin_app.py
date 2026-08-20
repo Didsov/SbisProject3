@@ -128,8 +128,24 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
             "text/html",
         )
         self.assertIn("Последний запуск", dashboard_html)
-        self.assertIn("Delivered", dashboard_html)
+        for label in (
+            "Получателей",
+            "Отправлено",
+            "Принято сервером",
+            "Bounce",
+            "Открыли",
+            "Кликнули",
+            "Длительность",
+            "Кампания",
+            "Selection",
+        ):
+            self.assertIn(label, dashboard_html)
+        self.assertIn("⚠ Частично", dashboard_html)
+        self.assertIn("12 мин", dashboard_html)
+        self.assertIn("Campaign &lt;unsafe&gt;", dashboard_html)
+        self.assertNotIn("Campaign <unsafe>", dashboard_html)
         self.assertIn('/admin/runs/7', dashboard_html)
+        self.get_messages.assert_called_once_with(7)
 
         runs_response = await self.client.get(
             "/admin/runs"
@@ -138,7 +154,25 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(runs_response.status, 200)
         self.assertIn("История запусков", runs_html)
-        self.assertIn("Recipients", runs_html)
+        for label in (
+            "Запуск",
+            "Кампания",
+            "Начало",
+            "Длительность",
+            "Получатели",
+            "Отправлено",
+            "Принято сервером",
+            "Ошибки",
+            "Статус",
+        ):
+            self.assertIn(label, runs_html)
+        self.assertIn("⚠ Частично", runs_html)
+        self.assertGreaterEqual(
+            runs_html.count('href="/admin/runs/7"'),
+            10,
+        )
+        self.assertIn('@media (max-width: 720px)', runs_html)
+        self.assertIn('data-label="Кампания"', runs_html)
         self.assertIn("Campaign &lt;unsafe&gt;", runs_html)
         self.assertNotIn("Campaign <unsafe>", runs_html)
         self.assertEqual(
@@ -158,9 +192,16 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.assertIn("Запуск #7", page_html)
         self.assertIn("Company &lt;One&gt;", page_html)
-        self.assertIn("Send status", page_html)
-        self.assertIn("Delivery status", page_html)
+        self.assertIn("Отправка", page_html)
+        self.assertIn("Доставка", page_html)
+        self.assertIn("Открытия", page_html)
+        self.assertIn("Клики", page_html)
+        self.assertIn("✓ Принято", page_html)
+        self.assertIn("Ошибки SMTP", page_html)
         self.assertIn("Последние события", page_html)
+        self.assertIn("Клик", page_html)
+        self.assertIn('<details class="event-data">', page_html)
+        self.assertIn("<summary>Данные</summary>", page_html)
         self.assertIn(
             '&lt;script&gt;alert(&quot;unsafe&quot;)&lt;/script&gt;',
             page_html,
@@ -224,6 +265,38 @@ class AdminAppCliTestCase(unittest.TestCase):
             run_app.call_args.kwargs["port"],
             8081,
         )
+
+
+class AdminAppPresentationTestCase(unittest.TestCase):
+    def test_all_required_statuses_are_localized(self) -> None:
+        cases = (
+            (admin_app._run_status, "success", "✓ Успешно"),
+            (admin_app._run_status, "partial", "⚠ Частично"),
+            (admin_app._run_status, "failed", "✕ Ошибка"),
+            (admin_app._run_status, "running", "… Выполняется"),
+            (admin_app._send_status, "sent", "✓"),
+            (admin_app._send_status, "failed", "✕"),
+            (admin_app._delivery_status, "delivered", "✓ Принято"),
+            (admin_app._delivery_status, "bounced", "✕ Bounce"),
+            (admin_app._delivery_status, "deferred", "… Ожидание"),
+            (admin_app._delivery_status, "unknown", "… Нет результата"),
+            (admin_app._event_status, "sent", "Отправлено"),
+            (admin_app._event_status, "delivered", "Принято сервером"),
+            (admin_app._event_status, "bounced", "Bounce"),
+            (admin_app._event_status, "deferred", "Временная ошибка"),
+            (admin_app._event_status, "opened", "Открыто"),
+            (admin_app._event_status, "clicked", "Клик"),
+        )
+
+        for renderer, status, label in cases:
+            with self.subTest(status=status, label=label):
+                self.assertIn(label, renderer(status))
+
+    def test_unknown_status_is_escaped(self) -> None:
+        rendered = admin_app._run_status("<script>alert(1)</script>")
+
+        self.assertIn("&lt;script&gt;", rendered)
+        self.assertNotIn("<script>", rendered)
 
 
 if __name__ == "__main__":
