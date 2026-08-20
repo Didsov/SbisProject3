@@ -1039,6 +1039,8 @@ def initialize_mailing_tables(
 
             recipient_id INTEGER NOT NULL,
 
+            run_id INTEGER,
+
             provider TEXT,
 
             provider_message_id TEXT,
@@ -1061,7 +1063,11 @@ def initialize_mailing_tables(
 
             FOREIGN KEY (recipient_id)
                 REFERENCES mail_recipients(id)
-                ON DELETE CASCADE
+                ON DELETE CASCADE,
+
+            FOREIGN KEY (run_id)
+                REFERENCES mail_runs(id)
+                ON DELETE SET NULL
         )
         """
     )
@@ -1092,6 +1098,15 @@ def initialize_mailing_tables(
             """
             ALTER TABLE mail_messages
             ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'unknown'
+            """
+        )
+    if "run_id" not in message_columns:
+        connection.execute(
+            """
+            ALTER TABLE mail_messages
+            ADD COLUMN run_id INTEGER
+                REFERENCES mail_runs(id)
+                ON DELETE SET NULL
             """
         )
 
@@ -1247,6 +1262,14 @@ def initialize_mailing_tables(
         CREATE INDEX IF NOT EXISTS
             idx_mail_messages_recipient_id
         ON mail_messages(recipient_id)
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_mail_messages_run_id
+        ON mail_messages(run_id)
         """
     )
 
@@ -2283,33 +2306,20 @@ def finish_mail_run(
             )
 
 
-def get_latest_mail_message_id() -> int:
-    """Получить верхнюю границу mail_messages перед запуском sender."""
-    with get_connection() as connection:
-        row = connection.execute(
-            """
-            SELECT COALESCE(MAX(id), 0) AS max_id
-            FROM mail_messages
-            """
-        ).fetchone()
-
-    return int(row["max_id"])
-
-
 def get_mail_run_message_counts(
     *,
+    run_id: int,
     campaign_id: int,
-    after_message_id: int,
 ) -> dict[str, int]:
-    """Посчитать боевые сообщения кампании, созданные после снимка ID."""
+    """Посчитать боевые сообщения, однозначно связанные с запуском."""
+    if run_id < 1:
+        raise ValueError(
+            "run_id должен быть больше 0"
+        )
+
     if campaign_id < 1:
         raise ValueError(
             "campaign_id должен быть больше 0"
-        )
-
-    if after_message_id < 0:
-        raise ValueError(
-            "after_message_id не может быть меньше 0"
         )
 
     with get_connection() as connection:
@@ -2368,13 +2378,13 @@ def get_mail_run_message_counts(
                 ON mr.id = mm.recipient_id
 
             WHERE
-                mr.campaign_id = ?
-                AND mm.id > ?
+                mm.run_id = ?
+                AND mr.campaign_id = ?
                 AND mm.is_test = 0
             """,
             (
+                run_id,
                 campaign_id,
-                after_message_id,
             ),
         ).fetchone()
 
@@ -2391,6 +2401,7 @@ def create_mail_message(
     recipient_id: int,
     provider: str,
     is_test: bool = False,
+    run_id: int | None = None,
 ) -> dict:
     """
     Создать попытку отправки письма до обращения к SMTP.
@@ -2410,8 +2421,12 @@ def create_mail_message(
             Имя почтового провайдера, например "smtp" или "mock".
 
         is_test:
-    Признак тестовой учётной попытки.
-    True сохраняется как 1, False как 0.
+            Признак тестовой учётной попытки.
+            True сохраняется как 1, False как 0.
+
+        run_id:
+            ID запуска mail_runs. Для прямых запусков sender вне daily-run
+            остаётся None.
 
     Возвращает:
         Словарь:
@@ -2432,6 +2447,11 @@ def create_mail_message(
     if recipient_id < 1:
         raise ValueError(
             "recipient_id должен быть больше 0"
+        )
+
+    if run_id is not None and run_id < 1:
+        raise ValueError(
+            "run_id должен быть больше 0 или равен None"
         )
 
     clean_provider = provider.strip()
@@ -2472,15 +2492,17 @@ def create_mail_message(
             """
             INSERT INTO mail_messages (
                 recipient_id,
+                run_id,
                 provider,
                 status,
                 tracking_token,
                 is_test
             )
-            VALUES (?, ?, 'pending', ?, ?)
+            VALUES (?, ?, ?, 'pending', ?, ?)
             """,
             (
                 recipient_id,
+                run_id,
                 clean_provider,
                 tracking_token,
                 int(is_test),

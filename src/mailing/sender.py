@@ -432,6 +432,7 @@ async def run_sender(
     campaign_id: int,
     limit: int,
     *,
+    run_id: int | None = None,
     dry_run: bool,
     mock_send: bool,
     smtp_send: bool,
@@ -594,6 +595,7 @@ async def run_sender(
                 recipient_id=recipient["recipient_id"],
                 provider=provider_name,
                 is_test=(tracking_test or not smtp_send),
+                run_id=run_id,
             )
 
             message_id = mail_message_record[

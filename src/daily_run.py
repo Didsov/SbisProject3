@@ -51,7 +51,6 @@ from src.database import (
     create_mail_run,
     finish_mail_run,
     get_connection,
-    get_latest_mail_message_id,
     get_or_create_mail_campaign,
     get_mail_run_message_counts,
     initialize_database,
@@ -81,13 +80,12 @@ def refresh_mail_run_counts(
     *,
     run_id: int,
     campaign_id: int,
-    after_message_id: int,
     recipients_added: int,
 ) -> dict[str, int]:
     """Пересчитать и сохранить счётчики сообщений текущего запуска."""
     message_counts = get_mail_run_message_counts(
+        run_id=run_id,
         campaign_id=campaign_id,
-        after_message_id=after_message_id,
     )
 
     update_mail_run_counts(
@@ -429,7 +427,6 @@ async def run_daily(
         trigger="manual",
     )
 
-    message_id_start = get_latest_mail_message_id()
     recipients_added = 0
     message_counts = {
         "sent_count": 0,
@@ -504,6 +501,7 @@ async def run_daily(
             await run_sender(
                 campaign_id=campaign_id,
                 limit=limit,
+                run_id=run_id,
                 dry_run=True,
                 mock_send=False,
                 smtp_send=False,
@@ -514,7 +512,6 @@ async def run_daily(
             message_counts = refresh_mail_run_counts(
                 run_id=run_id,
                 campaign_id=campaign_id,
-                after_message_id=message_id_start,
                 recipients_added=recipients_added,
             )
 
@@ -546,6 +543,7 @@ async def run_daily(
         await run_sender(
             campaign_id=campaign_id,
             limit=limit,
+            run_id=run_id,
             dry_run=False,
             mock_send=False,
             smtp_send=True,
@@ -556,7 +554,6 @@ async def run_daily(
         message_counts = refresh_mail_run_counts(
             run_id=run_id,
             campaign_id=campaign_id,
-            after_message_id=message_id_start,
             recipients_added=recipients_added,
         )
 
@@ -577,7 +574,6 @@ async def run_daily(
         message_counts = refresh_mail_run_counts(
             run_id=run_id,
             campaign_id=campaign_id,
-            after_message_id=message_id_start,
             recipients_added=recipients_added,
         )
 
@@ -626,8 +622,8 @@ async def run_daily(
 
         try:
             message_counts = get_mail_run_message_counts(
+                run_id=run_id,
                 campaign_id=campaign_id,
-                after_message_id=message_id_start,
             )
 
             finish_mail_run(
