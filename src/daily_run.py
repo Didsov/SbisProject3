@@ -613,7 +613,8 @@ async def _run_daily_locked(
         )
 
         await send_daily_report(
-            campaign_id
+            campaign_id,
+            run_id=run_id,
         )
 
         final_status = determine_mail_run_status(

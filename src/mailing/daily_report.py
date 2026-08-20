@@ -30,7 +30,10 @@ from html import escape
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
 
-from src.config import DAILY_REPORT_EMAILS
+from src.config import (
+    ADMIN_PUBLIC_URL,
+    DAILY_REPORT_EMAILS,
+)
 from src.database import (
     get_connection,
     initialize_database,
@@ -49,6 +52,18 @@ STATUS_SYMBOLS = {
     "unknown": "…",
     "pending": "…",
 }
+
+
+def build_admin_details_url(
+    run_id: int | None,
+) -> str:
+    """Сформировать публичную ссылку на текущий запуск или админку."""
+    base_url = ADMIN_PUBLIC_URL.rstrip("/")
+
+    if run_id is None:
+        return base_url
+
+    return f"{base_url}/runs/{run_id}"
 
 
 @dataclass(slots=True)
@@ -126,6 +141,8 @@ def get_campaign_delivery_rows(
 
 def build_html_report(
     rows: list[dict[str, object]],
+    *,
+    details_url: str,
 ) -> str:
     """
     Сформировать HTML-таблицу отчёта.
@@ -146,6 +163,10 @@ def build_html_report(
     )
 
     waiting = len(rows) - delivered - failed
+    safe_details_url = escape(
+        details_url,
+        quote=True,
+    )
 
     table_rows: list[str] = []
 
@@ -257,6 +278,23 @@ def build_html_report(
             </tbody>
         </table>
 
+        <p style="margin:20px 0;">
+            <a
+                href="{safe_details_url}"
+                style="
+                    display:inline-block;
+                    padding:11px 18px;
+                    border-radius:8px;
+                    background:#175cd3;
+                    color:#ffffff;
+                    font-weight:bold;
+                    text-decoration:none;
+                "
+            >
+                Открыть подробности в админке
+            </a>
+        </p>
+
         <p style="
             margin-top:16px;
             font-size:12px;
@@ -274,6 +312,8 @@ def build_html_report(
 
 def build_text_report(
     rows: list[dict[str, object]],
+    *,
+    details_url: str,
 ) -> str:
     """
     Сформировать текстовую версию отчёта.
@@ -298,6 +338,14 @@ def build_text_report(
             f"{row['company_name']} — "
             f"{row['email']}"
         )
+
+    lines.extend(
+        [
+            "",
+            "Подробности:",
+            details_url,
+        ]
+    )
 
     return "\n".join(lines)
 
@@ -401,6 +449,8 @@ def get_report_recipients() -> list[str]:
 
 async def send_daily_report(
     campaign_id: int,
+    *,
+    run_id: int | None = None,
 ) -> None:
     """
     Сформировать и отправить дневной отчёт.
@@ -408,13 +458,18 @@ async def send_daily_report(
     rows = get_campaign_delivery_rows(
         campaign_id
     )
+    details_url = build_admin_details_url(
+        run_id
+    )
 
     html_body = build_html_report(
-        rows
+        rows,
+        details_url=details_url,
     )
 
     text_body = build_text_report(
-        rows
+        rows,
+        details_url=details_url,
     )
 
     xlsx_bytes = build_xlsx_report(

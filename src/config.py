@@ -204,3 +204,8 @@ TEST_MAIL_EMAIL = optional_env(
 DAILY_REPORT_EMAILS = optional_env(
     "DAILY_REPORT_EMAILS"
 )
+
+ADMIN_PUBLIC_URL = optional_env(
+    "ADMIN_PUBLIC_URL",
+    "https://mail.projectsbis.ru/admin",
+)
