@@ -1098,7 +1098,24 @@ cd /opt/projectsbis/repository
 ```
 
 
+### 16.16 Тест полного цикла на сервере
 
+Сначала reset:
+```
+cd /opt/projectsbis/repository
+.venv/bin/python -m src.mailing.reset_test_selection --yes
+```
+
+После него тестовые компании остаются, но вся старая история рассылки для 990001 исчезает.
+
+Потом одна команда полного теста:
+```
+.venv/bin/python -m src.daily_run \
+    --selection 990001 \
+    --skip-load \
+    --send \
+    --confirm-real-send
+```
 ## 17. Что автоматизировано, а что ещё нет
 
 Статусы оценивают не только наличие функции, но и включение в рабочий процесс.
