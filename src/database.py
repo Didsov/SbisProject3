@@ -35,6 +35,21 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 MAX_MAIL_SEND_ATTEMPTS = 3
 
+MAIL_RUN_COUNTER_FIELDS = (
+    "recipients_added",
+    "sent_count",
+    "delivered_count",
+    "bounced_count",
+    "deferred_count",
+    "failed_count",
+)
+
+MAIL_RUN_FINAL_STATUSES = {
+    "success",
+    "partial",
+    "failed",
+}
+
 def get_connection() -> sqlite3.Connection:
     """
     Открыть соединение с основной SQLite-базой проекта.
@@ -923,6 +938,10 @@ def initialize_mailing_tables(
         поэтому получатель определяется сочетанием
         campaign_id + client_id + email.
 
+    - mail_runs:
+        Хранит отдельную историю каждого запуска daily-run,
+        независимо от повторного использования кампании.
+
     - mail_messages:
         Хранит факт попытки отправки письма
         конкретному получателю и идентификатор
@@ -1076,6 +1095,48 @@ def initialize_mailing_tables(
             """
         )
 
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mail_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            campaign_id INTEGER NOT NULL,
+            selection_id INTEGER NOT NULL,
+
+            trigger TEXT NOT NULL DEFAULT 'manual'
+                CHECK (trigger IN ('manual')),
+
+            status TEXT NOT NULL DEFAULT 'running'
+                CHECK (
+                    status IN (
+                        'running',
+                        'success',
+                        'partial',
+                        'failed'
+                    )
+                ),
+
+            started_at TEXT NOT NULL
+                DEFAULT CURRENT_TIMESTAMP,
+
+            finished_at TEXT,
+
+            recipients_added INTEGER NOT NULL DEFAULT 0,
+            sent_count INTEGER NOT NULL DEFAULT 0,
+            delivered_count INTEGER NOT NULL DEFAULT 0,
+            bounced_count INTEGER NOT NULL DEFAULT 0,
+            deferred_count INTEGER NOT NULL DEFAULT 0,
+            failed_count INTEGER NOT NULL DEFAULT 0,
+
+            error_text TEXT,
+
+            FOREIGN KEY (campaign_id)
+                REFERENCES mail_campaigns(id)
+                ON DELETE CASCADE
+        )
+        """
+    )
+
     # До разделения статусов Postfix заменял SMTP-статус
     # значениями delivered/deferred/bounced. Переносим эти значения
     # в отдельную колонку без изменения остальных данных сообщения.
@@ -1122,6 +1183,30 @@ def initialize_mailing_tables(
         CREATE INDEX IF NOT EXISTS
             idx_mail_campaigns_selection_id
         ON mail_campaigns(selection_id)
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_mail_runs_campaign_id
+        ON mail_runs(campaign_id)
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_mail_runs_status
+        ON mail_runs(status)
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_mail_runs_started_at
+        ON mail_runs(started_at)
         """
     )
 
@@ -1985,6 +2070,319 @@ def get_mail_campaign(
         )
 
     return dict(row)
+
+
+def create_mail_run(
+    *,
+    campaign_id: int,
+    selection_id: int,
+    trigger: str = "manual",
+) -> int:
+    """Создать отдельную запись запуска почтовой кампании."""
+    if campaign_id < 1:
+        raise ValueError(
+            "campaign_id должен быть больше 0"
+        )
+
+    if selection_id < 1:
+        raise ValueError(
+            "selection_id должен быть больше 0"
+        )
+
+    if trigger != "manual":
+        raise ValueError(
+            f"Неизвестный trigger mail run: {trigger!r}"
+        )
+
+    with get_connection() as connection:
+        campaign = connection.execute(
+            """
+            SELECT selection_id
+            FROM mail_campaigns
+            WHERE id = ?
+            """,
+            (campaign_id,),
+        ).fetchone()
+
+        if campaign is None:
+            raise LookupError(
+                f"Кампания с id={campaign_id} не найдена"
+            )
+
+        if campaign["selection_id"] != selection_id:
+            raise ValueError(
+                f"Кампания #{campaign_id} относится к выборке "
+                f"#{campaign['selection_id']}, а не #{selection_id}"
+            )
+
+        cursor = connection.execute(
+            """
+            INSERT INTO mail_runs (
+                campaign_id,
+                selection_id,
+                trigger,
+                status
+            )
+            VALUES (?, ?, ?, 'running')
+            """,
+            (
+                campaign_id,
+                selection_id,
+                trigger,
+            ),
+        )
+
+        run_id = cursor.lastrowid
+
+        if run_id is None:
+            raise RuntimeError(
+                "Не удалось получить id созданного mail_runs"
+            )
+
+        return int(run_id)
+
+
+def _validate_mail_run_counts(
+    counts: dict[str, int],
+) -> None:
+    """Проверить неотрицательные счётчики запуска."""
+    for field_name in MAIL_RUN_COUNTER_FIELDS:
+        value = counts[field_name]
+
+        if value < 0:
+            raise ValueError(
+                f"{field_name} не может быть меньше 0"
+            )
+
+
+def update_mail_run_counts(
+    run_id: int,
+    *,
+    recipients_added: int,
+    sent_count: int,
+    delivered_count: int,
+    bounced_count: int,
+    deferred_count: int,
+    failed_count: int,
+) -> None:
+    """Обновить текущие итоговые счётчики running-запуска."""
+    if run_id < 1:
+        raise ValueError(
+            "run_id должен быть больше 0"
+        )
+
+    counts = {
+        "recipients_added": recipients_added,
+        "sent_count": sent_count,
+        "delivered_count": delivered_count,
+        "bounced_count": bounced_count,
+        "deferred_count": deferred_count,
+        "failed_count": failed_count,
+    }
+    _validate_mail_run_counts(counts)
+
+    with get_connection() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE mail_runs
+            SET
+                recipients_added = ?,
+                sent_count = ?,
+                delivered_count = ?,
+                bounced_count = ?,
+                deferred_count = ?,
+                failed_count = ?
+            WHERE
+                id = ?
+                AND status = 'running'
+            """,
+            (
+                recipients_added,
+                sent_count,
+                delivered_count,
+                bounced_count,
+                deferred_count,
+                failed_count,
+                run_id,
+            ),
+        )
+
+        if cursor.rowcount != 1:
+            raise ValueError(
+                f"mail_runs #{run_id} не найден или уже завершён"
+            )
+
+
+def finish_mail_run(
+    run_id: int,
+    *,
+    status: str,
+    recipients_added: int,
+    sent_count: int,
+    delivered_count: int,
+    bounced_count: int,
+    deferred_count: int,
+    failed_count: int,
+    error_text: str | None = None,
+) -> None:
+    """Завершить running-запуск и атомарно сохранить его итог."""
+    if run_id < 1:
+        raise ValueError(
+            "run_id должен быть больше 0"
+        )
+
+    if status not in MAIL_RUN_FINAL_STATUSES:
+        raise ValueError(
+            f"Недопустимый финальный статус mail run: {status!r}"
+        )
+
+    counts = {
+        "recipients_added": recipients_added,
+        "sent_count": sent_count,
+        "delivered_count": delivered_count,
+        "bounced_count": bounced_count,
+        "deferred_count": deferred_count,
+        "failed_count": failed_count,
+    }
+    _validate_mail_run_counts(counts)
+
+    with get_connection() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE mail_runs
+            SET
+                status = ?,
+                finished_at = CURRENT_TIMESTAMP,
+                recipients_added = ?,
+                sent_count = ?,
+                delivered_count = ?,
+                bounced_count = ?,
+                deferred_count = ?,
+                failed_count = ?,
+                error_text = ?
+            WHERE
+                id = ?
+                AND status = 'running'
+            """,
+            (
+                status,
+                recipients_added,
+                sent_count,
+                delivered_count,
+                bounced_count,
+                deferred_count,
+                failed_count,
+                error_text,
+                run_id,
+            ),
+        )
+
+        if cursor.rowcount != 1:
+            raise ValueError(
+                f"mail_runs #{run_id} не найден или уже завершён"
+            )
+
+
+def get_latest_mail_message_id() -> int:
+    """Получить верхнюю границу mail_messages перед запуском sender."""
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT COALESCE(MAX(id), 0) AS max_id
+            FROM mail_messages
+            """
+        ).fetchone()
+
+    return int(row["max_id"])
+
+
+def get_mail_run_message_counts(
+    *,
+    campaign_id: int,
+    after_message_id: int,
+) -> dict[str, int]:
+    """Посчитать боевые сообщения кампании, созданные после снимка ID."""
+    if campaign_id < 1:
+        raise ValueError(
+            "campaign_id должен быть больше 0"
+        )
+
+    if after_message_id < 0:
+        raise ValueError(
+            "after_message_id не может быть меньше 0"
+        )
+
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT
+                SUM(
+                    CASE
+                        WHEN mm.status = 'sent'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS sent_count,
+
+                SUM(
+                    CASE
+                        WHEN
+                            mm.status = 'sent'
+                            AND mm.delivery_status = 'delivered'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS delivered_count,
+
+                SUM(
+                    CASE
+                        WHEN
+                            mm.status = 'sent'
+                            AND mm.delivery_status = 'bounced'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS bounced_count,
+
+                SUM(
+                    CASE
+                        WHEN
+                            mm.status = 'sent'
+                            AND mm.delivery_status = 'deferred'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS deferred_count,
+
+                SUM(
+                    CASE
+                        WHEN mm.status = 'failed'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS failed_count
+
+            FROM mail_messages AS mm
+
+            INNER JOIN mail_recipients AS mr
+                ON mr.id = mm.recipient_id
+
+            WHERE
+                mr.campaign_id = ?
+                AND mm.id > ?
+                AND mm.is_test = 0
+            """,
+            (
+                campaign_id,
+                after_message_id,
+            ),
+        ).fetchone()
+
+    return {
+        field_name: int(row[field_name] or 0)
+        for field_name in MAIL_RUN_COUNTER_FIELDS
+        if field_name != "recipients_added"
+    }
 
 
 

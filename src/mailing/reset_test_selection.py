@@ -10,6 +10,7 @@
 - mail_events;
 - mail_messages;
 - mail_recipients;
+- mail_runs;
 - mail_campaigns,
 
 связанные с тестовой выборкой.
@@ -25,7 +26,10 @@ from __future__ import annotations
 
 import argparse
 
-from src.database import get_connection
+from src.database import (
+    get_connection,
+    initialize_database,
+)
 
 
 TEST_SELECTION_ID = 990001
@@ -35,10 +39,13 @@ def reset_test_selection() -> dict[str, int]:
     """
     Очистить почтовую историю selection 990001.
     """
+    initialize_database()
+
     stats = {
         "events": 0,
         "messages": 0,
         "recipients": 0,
+        "runs": 0,
         "campaigns": 0,
     }
 
@@ -116,6 +123,19 @@ def reset_test_selection() -> dict[str, int]:
 
         stats["recipients"] = cursor.rowcount
 
+        # mail_runs
+        cursor = connection.execute(
+            f"""
+            DELETE FROM mail_runs
+            WHERE campaign_id IN (
+                {placeholders}
+            )
+            """,
+            tuple(campaign_ids),
+        )
+
+        stats["runs"] = cursor.rowcount
+
         # mail_campaigns
         cursor = connection.execute(
             f"""
@@ -173,6 +193,9 @@ def main() -> None:
     )
     print(
         f"mail_recipients удалено: {stats['recipients']}"
+    )
+    print(
+        f"mail_runs удалено: {stats['runs']}"
     )
     print(
         f"mail_campaigns удалено: {stats['campaigns']}"

@@ -48,10 +48,15 @@ from pathlib import Path
 
 from src.client_loader import run as run_client_loader
 from src.database import (
+    create_mail_run,
+    finish_mail_run,
     get_connection,
+    get_latest_mail_message_id,
     get_or_create_mail_campaign,
+    get_mail_run_message_counts,
     initialize_database,
     populate_mail_recipients,
+    update_mail_run_counts,
 )
 from src.mailing.daily_report import send_daily_report
 from src.mailing.postfix_delivery import (
@@ -70,6 +75,50 @@ DEFAULT_SEND_LIMIT = 1000
 
 DEFAULT_DELIVERY_WAIT_SECONDS = 60
 DEFAULT_DELIVERY_POLL_SECONDS = 5
+
+
+def refresh_mail_run_counts(
+    *,
+    run_id: int,
+    campaign_id: int,
+    after_message_id: int,
+    recipients_added: int,
+) -> dict[str, int]:
+    """Пересчитать и сохранить счётчики сообщений текущего запуска."""
+    message_counts = get_mail_run_message_counts(
+        campaign_id=campaign_id,
+        after_message_id=after_message_id,
+    )
+
+    update_mail_run_counts(
+        run_id,
+        recipients_added=recipients_added,
+        **message_counts,
+    )
+
+    return message_counts
+
+
+def determine_mail_run_status(
+    counts: dict[str, int],
+) -> str:
+    """Определить success/partial по завершённым результатам писем."""
+    if any(
+        counts[field_name] > 0
+        for field_name in (
+            "bounced_count",
+            "deferred_count",
+            "failed_count",
+        )
+    ):
+        return "partial"
+
+    # Неизвестный delivery_status после ожидания тоже означает,
+    # что запуск пока нельзя считать полностью успешным.
+    if counts["delivered_count"] < counts["sent_count"]:
+        return "partial"
+
+    return "success"
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -310,6 +359,36 @@ async def wait_for_delivery_results(
         elapsed += wait_seconds
 
 
+async def load_daily_selection(
+    *,
+    selection_id: int,
+    skip_load: bool,
+) -> None:
+    """Выполнить существующий этап загрузки и обогащения выборки."""
+    if skip_load:
+        print()
+        print(
+            "Загрузка СБИС пропущена (--skip-load)."
+        )
+        print(
+            "Используются уже существующие данные БД."
+        )
+        return
+
+    print()
+    print(
+        "ЭТАП 1: загрузка выборки и обогащение"
+    )
+
+    await run_client_loader(
+        selection_id=selection_id,
+        inn=None,
+        inn_file=None,
+        enrich_limit=0,
+        enrich_all=True,
+    )
+
+
 async def run_daily(
     *,
     selection_id: int,
@@ -335,40 +414,6 @@ async def run_daily(
     # также в режиме --skip-load.
     initialize_database()
 
-    # ---------------------------------------------------------
-    # 1. СБИС + ОБОГАЩЕНИЕ
-    # ---------------------------------------------------------
-    if skip_load:
-        print()
-        print(
-            "Загрузка СБИС пропущена (--skip-load)."
-        )
-        print(
-            "Используются уже существующие данные БД."
-        )
-
-    else:
-        print()
-        print(
-            "ЭТАП 1: загрузка выборки и обогащение"
-        )
-
-        await run_client_loader(
-            selection_id=selection_id,
-            inn=None,
-            inn_file=None,
-            enrich_limit=0,
-            enrich_all=True,
-        )
-
-    # ---------------------------------------------------------
-    # 2. ДНЕВНАЯ КАМПАНИЯ
-    # ---------------------------------------------------------
-    print()
-    print(
-        "ЭТАП 2: подготовка дневной кампании"
-    )
-
     campaign_name = build_campaign_name(
         selection_id
     )
@@ -378,9 +423,21 @@ async def run_daily(
         selection_id=selection_id,
     )
 
-    ensure_campaign_template(
-        campaign_id
+    run_id = create_mail_run(
+        campaign_id=campaign_id,
+        selection_id=selection_id,
+        trigger="manual",
     )
+
+    message_id_start = get_latest_mail_message_id()
+    recipients_added = 0
+    message_counts = {
+        "sent_count": 0,
+        "delivered_count": 0,
+        "bounced_count": 0,
+        "deferred_count": 0,
+        "failed_count": 0,
+    }
 
     print(
         f"Campaign: {campaign_name}"
@@ -388,101 +445,210 @@ async def run_daily(
     print(
         f"Campaign ID: {campaign_id}"
     )
-
-    # ---------------------------------------------------------
-    # 3. ПОЛУЧАТЕЛИ
-    # ---------------------------------------------------------
-    print()
     print(
-        "ЭТАП 3: формирование получателей"
+        f"Mail run ID: {run_id}"
     )
 
-    added = populate_mail_recipients(
-        campaign_id
-    )
+    try:
+        # ---------------------------------------------------------
+        # 1. СБИС + ОБОГАЩЕНИЕ
+        # ---------------------------------------------------------
+        await load_daily_selection(
+            selection_id=selection_id,
+            skip_load=skip_load,
+        )
 
-    print(
-        f"Новых получателей добавлено: {added}"
-    )
-
-    # ---------------------------------------------------------
-    # 4. DRY RUN / SMTP
-    # ---------------------------------------------------------
-    if not real_send:
+        # ---------------------------------------------------------
+        # 2. ДНЕВНАЯ КАМПАНИЯ
+        # ---------------------------------------------------------
         print()
         print(
-            "РЕЖИМ БЕЗ РЕАЛЬНОЙ ОТПРАВКИ."
+            "ЭТАП 2: подготовка дневной кампании"
+        )
+
+        ensure_campaign_template(
+            campaign_id
+        )
+
+        # ---------------------------------------------------------
+        # 3. ПОЛУЧАТЕЛИ
+        # ---------------------------------------------------------
+        print()
+        print(
+            "ЭТАП 3: формирование получателей"
+        )
+
+        recipients_added = populate_mail_recipients(
+            campaign_id
+        )
+
+        update_mail_run_counts(
+            run_id,
+            recipients_added=recipients_added,
+            **message_counts,
+        )
+
+        print(
+            f"Новых получателей добавлено: {recipients_added}"
+        )
+
+        # ---------------------------------------------------------
+        # 4. DRY RUN / SMTP
+        # ---------------------------------------------------------
+        if not real_send:
+            print()
+            print(
+                "РЕЖИМ БЕЗ РЕАЛЬНОЙ ОТПРАВКИ."
+            )
+
+            await run_sender(
+                campaign_id=campaign_id,
+                limit=limit,
+                dry_run=True,
+                mock_send=False,
+                smtp_send=False,
+                test_emails=[],
+                tracking_test=False,
+            )
+
+            message_counts = refresh_mail_run_counts(
+                run_id=run_id,
+                campaign_id=campaign_id,
+                after_message_id=message_id_start,
+                recipients_added=recipients_added,
+            )
+
+            finish_mail_run(
+                run_id,
+                status="success",
+                recipients_added=recipients_added,
+                **message_counts,
+            )
+
+            print()
+            print(
+                "Daily dry-run завершён."
+            )
+            print(
+                f"Campaign ID: {campaign_id}"
+            )
+            print(
+                f"Mail run ID: {run_id}"
+            )
+
+            return
+
+        print()
+        print(
+            "ЭТАП 4: реальная SMTP-рассылка"
         )
 
         await run_sender(
             campaign_id=campaign_id,
             limit=limit,
-            dry_run=True,
+            dry_run=False,
             mock_send=False,
-            smtp_send=False,
+            smtp_send=True,
             test_emails=[],
             tracking_test=False,
         )
 
+        message_counts = refresh_mail_run_counts(
+            run_id=run_id,
+            campaign_id=campaign_id,
+            after_message_id=message_id_start,
+            recipients_added=recipients_added,
+        )
+
+        # ---------------------------------------------------------
+        # 5. POSTFIX DELIVERY
+        # ---------------------------------------------------------
         print()
         print(
-            "Daily dry-run завершён."
+            "ЭТАП 5: delivered / bounced"
         )
+
+        await wait_for_delivery_results(
+            campaign_id=campaign_id,
+            log_path=mail_log,
+            timeout_seconds=delivery_wait,
+        )
+
+        message_counts = refresh_mail_run_counts(
+            run_id=run_id,
+            campaign_id=campaign_id,
+            after_message_id=message_id_start,
+            recipients_added=recipients_added,
+        )
+
+        # ---------------------------------------------------------
+        # 6. DAILY REPORT
+        # ---------------------------------------------------------
+        print()
+        print(
+            "ЭТАП 6: дневной отчёт"
+        )
+
+        await send_daily_report(
+            campaign_id
+        )
+
+        final_status = determine_mail_run_status(
+            message_counts
+        )
+
+        finish_mail_run(
+            run_id,
+            status=final_status,
+            recipients_added=recipients_added,
+            **message_counts,
+        )
+
+        print()
+        print("=" * 60)
+        print("DAILY RUN ЗАВЕРШЁН")
+        print("=" * 60)
+
         print(
             f"Campaign ID: {campaign_id}"
         )
+        print(
+            f"Mail run ID: {run_id}"
+        )
+        print(
+            f"Mail run status: {final_status}"
+        )
 
-        return
+    except Exception as error:
+        error_text = (
+            f"{type(error).__name__}: {error}"
+        )
 
-    print()
-    print(
-        "ЭТАП 4: реальная SMTP-рассылка"
-    )
+        try:
+            message_counts = get_mail_run_message_counts(
+                campaign_id=campaign_id,
+                after_message_id=message_id_start,
+            )
 
-    await run_sender(
-        campaign_id=campaign_id,
-        limit=limit,
-        dry_run=False,
-        mock_send=False,
-        smtp_send=True,
-        test_emails=[],
-        tracking_test=False,
-    )
+            finish_mail_run(
+                run_id,
+                status="failed",
+                recipients_added=recipients_added,
+                error_text=error_text,
+                **message_counts,
+            )
+        except Exception as history_error:
+            print(
+                "Не удалось сохранить failed в mail_runs: "
+                f"{history_error}"
+            )
 
-    # ---------------------------------------------------------
-    # 5. POSTFIX DELIVERY
-    # ---------------------------------------------------------
-    print()
-    print(
-        "ЭТАП 5: delivered / bounced"
-    )
+        print(
+            f"Mail run #{run_id} завершён с ошибкой: "
+            f"{error_text}"
+        )
 
-    await wait_for_delivery_results(
-        campaign_id=campaign_id,
-        log_path=mail_log,
-        timeout_seconds=delivery_wait,
-    )
-
-    # ---------------------------------------------------------
-    # 6. DAILY REPORT
-    # ---------------------------------------------------------
-    print()
-    print(
-        "ЭТАП 6: дневной отчёт"
-    )
-
-    await send_daily_report(
-        campaign_id
-    )
-
-    print()
-    print("=" * 60)
-    print("DAILY RUN ЗАВЕРШЁН")
-    print("=" * 60)
-
-    print(
-        f"Campaign ID: {campaign_id}"
-    )
+        raise
 
 
 def main() -> None:
