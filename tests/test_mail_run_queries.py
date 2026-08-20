@@ -143,6 +143,33 @@ class MailRunQueriesTestCase(unittest.TestCase):
                     (self.campaign_id,),
                 ).lastrowid
             )
+            self.run_empty = int(
+                connection.execute(
+                    """
+                    INSERT INTO mail_runs (
+                        campaign_id,
+                        selection_id,
+                        trigger,
+                        status,
+                        started_at,
+                        finished_at,
+                        recipients_added,
+                        sent_count,
+                        delivered_count,
+                        bounced_count,
+                        deferred_count,
+                        failed_count
+                    )
+                    VALUES (
+                        ?, 5984, 'manual', 'success',
+                        '2026-08-21 09:00:00',
+                        '2026-08-21 09:01:00',
+                        0, 0, 0, 0, 0, 0
+                    )
+                    """,
+                    (self.campaign_id,),
+                ).lastrowid
+            )
 
             self.message_a = self._insert_message(
                 connection,
@@ -294,7 +321,7 @@ class MailRunQueriesTestCase(unittest.TestCase):
                 "failed_count",
             },
         )
-        self.assertEqual(runs[0]["run_id"], self.run_b)
+        self.assertEqual(runs[0]["run_id"], self.run_empty)
         self.assertEqual(runs[0]["campaign_id"], self.campaign_id)
         self.assertEqual(
             runs[0]["campaign_name"],
@@ -302,16 +329,27 @@ class MailRunQueriesTestCase(unittest.TestCase):
         )
         self.assertEqual(runs[0]["selection_id"], 5984)
         self.assertEqual(runs[0]["trigger"], "manual")
-        self.assertEqual(runs[0]["status"], "partial")
-        self.assertEqual(runs[0]["recipients_added"], 2)
-        self.assertEqual(runs[0]["sent_count"], 1)
+        self.assertEqual(runs[0]["status"], "success")
+        self.assertEqual(runs[0]["recipients_added"], 0)
+        self.assertEqual(runs[0]["sent_count"], 0)
         self.assertEqual(runs[0]["delivered_count"], 0)
-        self.assertEqual(runs[0]["bounced_count"], 1)
+        self.assertEqual(runs[0]["bounced_count"], 0)
         self.assertEqual(runs[0]["deferred_count"], 0)
-        self.assertEqual(runs[0]["failed_count"], 1)
+        self.assertEqual(runs[0]["failed_count"], 0)
 
         with self.assertRaises(ValueError):
             database.get_recent_mail_runs(limit=0)
+
+    def test_get_latest_mail_run_with_sent_messages_skips_empty_run(
+        self,
+    ) -> None:
+        run = database.get_latest_mail_run_with_sent_messages()
+
+        self.assertIsNotNone(run)
+        assert run is not None
+        self.assertEqual(run["run_id"], self.run_b)
+        self.assertEqual(run["sent_count"], 1)
+        self.assertNotEqual(run["run_id"], self.run_empty)
 
     def test_get_mail_run_details(self) -> None:
         details = database.get_mail_run_details(self.run_b)
@@ -457,6 +495,7 @@ class MailRunQueriesTestCase(unittest.TestCase):
             side_effect=get_traced_connection,
         ):
             database.get_recent_mail_runs(limit=10)
+            database.get_latest_mail_run_with_sent_messages()
             database.get_mail_run_details(self.run_a)
             database.get_mail_run_messages(self.run_a)
             database.get_mail_run_events(self.run_a)

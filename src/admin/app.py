@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from datetime import datetime
 from html import escape
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 from aiohttp import web
 
 from src.database import (
+    get_latest_mail_run_with_sent_messages,
     get_mail_run_details,
     get_mail_run_events,
     get_mail_run_messages,
@@ -184,6 +185,41 @@ def _run_status(value: object) -> str:
     return _badge(value, RUN_STATUSES)
 
 
+def _is_empty_successful_run(
+    run: Mapping[str, object],
+) -> bool:
+    """Определить успешную проверку без новых получателей и отправок."""
+    return (
+        run.get("status") == "success"
+        and int(run.get("recipients_added") or 0) == 0
+        and int(run.get("sent_count") or 0) == 0
+        and int(run.get("failed_count") or 0) == 0
+    )
+
+
+def _display_run_status(
+    run: Mapping[str, object],
+) -> str:
+    """Показать статус запуска без изменения значения в БД."""
+    if _is_empty_successful_run(run):
+        return (
+            '<span class="status status-empty">'
+            "○ Нет новых получателей"
+            "</span>"
+        )
+    return _run_status(run.get("status"))
+
+
+def _latest_check_text(
+    run: Mapping[str, object],
+) -> str:
+    """Кратко описать последний фактический запуск для dashboard."""
+    run_id = int(run["run_id"])
+    if _is_empty_successful_run(run):
+        return f"#{run_id} — новых получателей нет"
+    return f"#{run_id} — запуск завершён"
+
+
 def _send_status(value: object) -> str:
     return _badge(value, SEND_STATUSES)
 
@@ -327,15 +363,61 @@ async def handle_admin(request: web.Request) -> web.Response:
     if not runs:
         content = """
         <div class="page-heading">
-            <div class="eyebrow">Рассылки</div><h1>Последний запуск</h1>
+            <div class="eyebrow">Рассылки</div><h1>Последняя рассылка</h1>
         </div>
         <section class="panel empty">Запуски рассылки пока отсутствуют.</section>
         """
         return _response(title="Сводка", content=content)
 
-    latest = runs[0]
-    run_id = int(latest["run_id"])
-    messages = get_mail_run_messages(run_id)
+    latest_run = runs[0]
+    latest_run_id = int(latest_run["run_id"])
+    latest_mailing = get_latest_mail_run_with_sent_messages()
+    latest_check = (
+        '<section class="panel run-card"><div class="run-card-header">'
+        + '<div><h2 class="run-card-title">Последний запуск</h2>'
+        + '<p class="subtitle">Последняя проверка: '
+        + f"<strong>{escape(_latest_check_text(latest_run))}</strong>"
+        + "</p></div>"
+        + f'<a class="text-link" href="/admin/runs/{latest_run_id}">Открыть запуск →</a>'
+        + "</div>"
+        + _details(
+            (
+                ("Статус", _display_run_status(latest_run)),
+                ("Начало", _value(latest_run["started_at"])),
+                ("Окончание", _value(latest_run["finished_at"])),
+                (
+                    "Длительность",
+                    escape(
+                        _duration(
+                            latest_run["started_at"],
+                            latest_run["finished_at"],
+                        )
+                    ),
+                ),
+                ("Кампания", _value(latest_run["campaign_name"])),
+                ("Selection", _value(latest_run["selection_id"])),
+            )
+        )
+        + "</section>"
+    )
+    heading = (
+        '<div class="page-heading"><div class="eyebrow">Рассылки</div>'
+        '<h1>Последняя рассылка</h1>'
+        '<p class="subtitle">Ключевые результаты последней ежедневной рассылки.</p></div>'
+    )
+
+    if latest_mailing is None:
+        content = (
+            heading
+            + '<section class="panel empty">'
+            + "Рассылок с отправленными сообщениями пока нет."
+            + "</section>"
+            + latest_check
+        )
+        return _response(title="Сводка", content=content)
+
+    mailing_run_id = int(latest_mailing["run_id"])
+    messages = get_mail_run_messages(mailing_run_id)
     opened_count = sum(
         int(message["opened_count"] or 0) > 0
         for message in messages
@@ -344,36 +426,38 @@ async def handle_admin(request: web.Request) -> web.Response:
         int(message["clicked_count"] or 0) > 0
         for message in messages
     )
-    duration = _duration(latest["started_at"], latest["finished_at"])
+    mailing_duration = _duration(
+        latest_mailing["started_at"],
+        latest_mailing["finished_at"],
+    )
     content = (
-        '<div class="page-heading"><div class="eyebrow">Рассылки</div>'
-        '<h1>Последний запуск</h1>'
-        '<p class="subtitle">Ключевые результаты последней ежедневной рассылки.</p></div>'
+        heading
         + _metrics(
             (
-                ("Получателей", latest["recipients_added"]),
-                ("Отправлено", latest["sent_count"]),
-                ("Принято сервером", latest["delivered_count"]),
-                ("Bounce", latest["bounced_count"]),
+                ("Получателей", latest_mailing["recipients_added"]),
+                ("Отправлено", latest_mailing["sent_count"]),
+                ("Принято сервером", latest_mailing["delivered_count"]),
+                ("Bounce", latest_mailing["bounced_count"]),
                 ("Открыли", opened_count),
                 ("Кликнули", clicked_count),
             )
         )
         + '<section class="panel run-card"><div class="run-card-header">'
-        + '<h2 class="run-card-title">Параметры запуска</h2>'
-        + f'<a class="text-link" href="/admin/runs/{run_id}">Подробнее о запуске →</a>'
+        + '<h2 class="run-card-title">Параметры рассылки</h2>'
+        + f'<a class="text-link" href="/admin/runs/{mailing_run_id}">Подробнее о рассылке →</a>'
         + "</div>"
         + _details(
             (
-                ("Статус", _run_status(latest["status"])),
-                ("Начало", _value(latest["started_at"])),
-                ("Окончание", _value(latest["finished_at"])),
-                ("Длительность", escape(duration)),
-                ("Кампания", _value(latest["campaign_name"])),
-                ("Selection", _value(latest["selection_id"])),
+                ("Статус", _display_run_status(latest_mailing)),
+                ("Начало", _value(latest_mailing["started_at"])),
+                ("Окончание", _value(latest_mailing["finished_at"])),
+                ("Длительность", escape(mailing_duration)),
+                ("Кампания", _value(latest_mailing["campaign_name"])),
+                ("Selection", _value(latest_mailing["selection_id"])),
             )
         )
         + "</section>"
+        + latest_check
     )
     return _response(title="Сводка", content=content)
 
@@ -407,7 +491,7 @@ async def handle_runs(request: web.Request) -> web.Response:
                     _value(run["delivered_count"]),
                     _value(run["bounced_count"]),
                     _value(run["failed_count"]),
-                    _run_status(run["status"]),
+                    _display_run_status(run),
                 ),
                 f'/admin/runs/{int(run["run_id"])}',
             )
@@ -521,7 +605,7 @@ async def handle_run_details(request: web.Request) -> web.Response:
         + '<section class="panel run-card">'
         + _details(
             (
-                ("Статус", _run_status(details["status"])),
+                ("Статус", _display_run_status(details)),
                 ("Кампания", _value(details["campaign_name"])),
                 ("Selection", _value(details["selection_id"])),
                 ("Начало", _value(details["started_at"])),

@@ -25,6 +25,20 @@ RUN = {
     "failed_count": 0,
 }
 
+EMPTY_RUN = {
+    **RUN,
+    "run_id": 8,
+    "status": "success",
+    "started_at": "2026-08-21 09:00:00",
+    "finished_at": "2026-08-21 09:01:00",
+    "recipients_added": 0,
+    "sent_count": 0,
+    "delivered_count": 0,
+    "bounced_count": 0,
+    "deferred_count": 0,
+    "failed_count": 0,
+}
+
 DETAILS = {
     **RUN,
     "error_text": None,
@@ -62,7 +76,12 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
         self.recent_patcher = patch.object(
             admin_app,
             "get_recent_mail_runs",
-            return_value=[RUN],
+            return_value=[EMPTY_RUN],
+        )
+        self.latest_mailing_patcher = patch.object(
+            admin_app,
+            "get_latest_mail_run_with_sent_messages",
+            return_value=RUN,
         )
         self.details_patcher = patch.object(
             admin_app,
@@ -81,6 +100,7 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
         )
 
         self.get_recent = self.recent_patcher.start()
+        self.get_latest_mailing = self.latest_mailing_patcher.start()
         self.get_details = self.details_patcher.start()
         self.get_messages = self.messages_patcher.start()
         self.get_events = self.events_patcher.start()
@@ -95,6 +115,7 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
         self.events_patcher.stop()
         self.messages_patcher.stop()
         self.details_patcher.stop()
+        self.latest_mailing_patcher.stop()
         self.recent_patcher.stop()
 
     async def test_routes_are_registered(self) -> None:
@@ -127,7 +148,11 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
             dashboard_response.content_type,
             "text/html",
         )
+        self.assertIn("Последняя рассылка", dashboard_html)
         self.assertIn("Последний запуск", dashboard_html)
+        self.assertIn("Последняя проверка:", dashboard_html)
+        self.assertIn("#8 — новых получателей нет", dashboard_html)
+        self.assertIn("○ Нет новых получателей", dashboard_html)
         for label in (
             "Получателей",
             "Отправлено",
@@ -145,6 +170,8 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Campaign &lt;unsafe&gt;", dashboard_html)
         self.assertNotIn("Campaign <unsafe>", dashboard_html)
         self.assertIn('/admin/runs/7', dashboard_html)
+        self.assertIn('/admin/runs/8', dashboard_html)
+        self.get_latest_mailing.assert_called_once_with()
         self.get_messages.assert_called_once_with(7)
 
         runs_response = await self.client.get(
@@ -166,9 +193,10 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
             "Статус",
         ):
             self.assertIn(label, runs_html)
-        self.assertIn("⚠ Частично", runs_html)
+        self.assertIn("○ Нет новых получателей", runs_html)
+        self.assertNotIn("✓ Успешно", runs_html)
         self.assertGreaterEqual(
-            runs_html.count('href="/admin/runs/7"'),
+            runs_html.count('href="/admin/runs/8"'),
             10,
         )
         self.assertIn('@media (max-width: 720px)', runs_html)
@@ -210,6 +238,24 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
         self.get_details.assert_called_once_with(7)
         self.get_messages.assert_called_once_with(7)
         self.get_events.assert_called_once_with(7)
+
+    async def test_dashboard_without_prior_mailing_keeps_latest_run(
+        self,
+    ) -> None:
+        self.get_latest_mailing.return_value = None
+
+        response = await self.client.get("/admin")
+        page_html = await response.text()
+
+        self.assertEqual(response.status, 200)
+        self.assertIn("Последняя рассылка", page_html)
+        self.assertIn(
+            "Рассылок с отправленными сообщениями пока нет.",
+            page_html,
+        )
+        self.assertIn("#8 — новых получателей нет", page_html)
+        self.assertIn("○ Нет новых получателей", page_html)
+        self.get_messages.assert_not_called()
 
     async def test_invalid_run_id_returns_400(self) -> None:
         response = await self.client.get(
@@ -297,6 +343,13 @@ class AdminAppPresentationTestCase(unittest.TestCase):
 
         self.assertIn("&lt;script&gt;", rendered)
         self.assertNotIn("<script>", rendered)
+
+    def test_empty_successful_run_has_neutral_status(self) -> None:
+        rendered = admin_app._display_run_status(EMPTY_RUN)
+
+        self.assertIn("○ Нет новых получателей", rendered)
+        self.assertNotIn("✓ Успешно", rendered)
+        self.assertEqual(EMPTY_RUN["status"], "success")
 
 
 if __name__ == "__main__":

@@ -2444,6 +2444,48 @@ def get_recent_mail_runs(
     ]
 
 
+def get_latest_mail_run_with_sent_messages(
+) -> dict[str, object] | None:
+    """Получить последний запуск, в котором были отправлены письма."""
+    with closing(get_connection()) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                mr.id AS run_id,
+                mr.campaign_id,
+                mc.name AS campaign_name,
+                mr.selection_id,
+                mr.trigger,
+                mr.status,
+                mr.started_at,
+                mr.finished_at,
+                mr.recipients_added,
+                mr.sent_count,
+                mr.delivered_count,
+                mr.bounced_count,
+                mr.deferred_count,
+                mr.failed_count
+            FROM mail_runs AS mr
+
+            INNER JOIN mail_campaigns AS mc
+                ON mc.id = mr.campaign_id
+
+            WHERE mr.sent_count > 0
+
+            ORDER BY
+                mr.started_at DESC,
+                mr.id DESC
+
+            LIMIT 1
+            """
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    return dict(row)
+
+
 def get_mail_run_details(
     run_id: int,
 ) -> dict[str, object]:
