@@ -1,0 +1,10 @@
+[Unit]
+Description=ProjectSbis Daily Mailing
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/projectsbis/repository
+EnvironmentFile=/etc/projectsbis/projectsbis.env
+ExecStart=/opt/projectsbis/repository/.venv/bin/python -m src.daily_run --selection 5984 --send --confirm-real-send

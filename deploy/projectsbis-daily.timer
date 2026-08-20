@@ -1,0 +1,10 @@
+[Unit]
+Description=Run ProjectSbis daily mailing at 09:00 VLAT
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+Unit=projectsbis-daily.service
+
+[Install]
+WantedBy=timers.target
