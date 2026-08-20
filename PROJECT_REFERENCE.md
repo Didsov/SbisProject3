@@ -1073,6 +1073,32 @@ python -m src.sql_export `
 
 Ожидается путь сохранённого файла и количество строк.
 
+### 16.14. Сброс тестовой выборки
+
+```powershell
+python -m src.mailing.reset_test_selection --yes
+```
+```powershell
+cd /opt/projectsbis/repository
+
+.venv/bin/python -m src.mailing.reset_test_selection --yes
+```
+
+### 16.15. Отправка репорта по отчетам 
+
+```powershell
+python -m src.mailing.daily_report \
+    --campaign-id 2
+```
+```powershell
+cd /opt/projectsbis/repository
+
+.venv/bin/python -m src.mailing.daily_report \
+    --campaign-id 2
+```
+
+
+
 ## 17. Что автоматизировано, а что ещё нет
 
 Статусы оценивают не только наличие функции, но и включение в рабочий процесс.
