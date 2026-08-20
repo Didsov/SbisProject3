@@ -1,0 +1,15 @@
+[Unit]
+Description=ProjectSbis Read-Only Admin
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/projectsbis/repository
+EnvironmentFile=/etc/projectsbis/projectsbis.env
+ExecStart=/opt/projectsbis/repository/.venv/bin/python -m src.admin.app
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -992,6 +992,72 @@ sudo systemctl disable --now projectsbis-daily.timer
 включён на VPS. Это подтверждается только командами `is-enabled`, `is-active`
 и `list-timers` на production-сервере.
 
+### 15.7. Управление read-only админкой через systemd
+
+Unit-файл админки хранится в репозитории:
+
+```text
+deploy/projectsbis-admin.service
+```
+
+Сервис постоянно запускает `python -m src.admin.app` из production checkout.
+Само приложение привязано только к `127.0.0.1:8081`; unit не меняет адрес
+прослушивания и не публикует админку наружу.
+
+Установка unit-файла:
+
+```bash
+cd /opt/projectsbis/repository
+sudo cp deploy/projectsbis-admin.service /etc/systemd/system/
+sudo systemctl daemon-reload
+```
+
+Проверка синтаксиса установленного unit-файла:
+
+```bash
+sudo systemd-analyze verify /etc/systemd/system/projectsbis-admin.service
+```
+
+Включение автозапуска и немедленный запуск:
+
+```bash
+sudo systemctl enable --now projectsbis-admin.service
+```
+
+Отдельные команды запуска, перезапуска и остановки:
+
+```bash
+sudo systemctl start projectsbis-admin.service
+sudo systemctl restart projectsbis-admin.service
+sudo systemctl stop projectsbis-admin.service
+```
+
+Проверка состояния и журналов:
+
+```bash
+systemctl is-enabled projectsbis-admin.service
+systemctl is-active projectsbis-admin.service
+systemctl status projectsbis-admin.service --no-pager
+journalctl -u projectsbis-admin.service -n 100 --no-pager
+journalctl -u projectsbis-admin.service -f
+```
+
+Проверка локального адреса после запуска:
+
+```bash
+curl -I http://127.0.0.1:8081/admin
+ss -ltnp | grep '127.0.0.1:8081'
+```
+
+Отключение автозапуска с остановкой сервиса:
+
+```bash
+sudo systemctl disable --now projectsbis-admin.service
+```
+
+Наличие unit-файла и этих команд в Git не означает, что сервис уже установлен
+или запущен на VPS. Это проверяется только через `systemctl` на сервере.
+
 ## 16. Типовые сценарии
 
 ### 16.1. Получить и обогатить выборку 5984
