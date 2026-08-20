@@ -57,9 +57,11 @@ MESSAGE_ID_RE = re.compile(
 
 DELIVERY_RE = re.compile(
     r"""
+    postfix/smtp\[\d+\]:
+    \s+
     (?P<queue_id>[A-F0-9]+):
-    .*?
-    \bto=<(?P<recipient>[^>]+)>
+    \s+
+    to=<(?P<recipient>[^>]+)>
     .*?
     \bdsn=(?P<dsn>[0-9.]+)
     .*?
@@ -69,7 +71,6 @@ DELIVERY_RE = re.compile(
     """,
     re.VERBOSE,
 )
-
 
 POSTFIX_STATUS_MAP = {
     "sent": "delivered",
