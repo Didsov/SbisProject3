@@ -55,8 +55,8 @@ CRMClients.ListClientsOnline или поиск по ИНН
     → get_mail_campaign_stats()
 ```
 
-Сейчас это набор связанных рабочих этапов, а не одна ежедневная команда.
-Главного daily-оркестратора и итогового отчёта запуска в репозитории нет.
+Ежедневный сценарий объединён в `src.daily_run`, а каждый запуск фиксируется
+отдельной строкой `mail_runs` и завершается итоговым отчётом.
 Tracking-сервис работает отдельно и должен быть постоянно запущен на VPS.
 
 ## 2. Основные подсистемы
@@ -927,6 +927,71 @@ sudo tail -n 100 /var/log/mail.log
 | Реальная SMTP-рассылка | Не рекомендуется | Да |
 | Tracking HTTP-service | Для локальной отладки | Постоянно на VPS |
 
+### 15.6. Управление ежедневным systemd timer
+
+Unit-файлы хранятся в репозитории:
+
+```text
+deploy/projectsbis-daily.service
+deploy/projectsbis-daily.timer
+```
+
+Timer запускает production-команду `src.daily_run` ежедневно в `09:00` по
+системному часовому поясу VPS `Asia/Vladivostok`. `Persistent=true` означает,
+что пропущенный во время выключения сервера календарный запуск будет выполнен
+после следующей активации timer. Параллельный второй `daily_run` останавливается
+OS-level блокировкой до создания `mail_runs` и отправки писем.
+
+Установка unit-файлов:
+
+```bash
+cd /opt/projectsbis/repository
+sudo cp deploy/projectsbis-daily.service /etc/systemd/system/
+sudo cp deploy/projectsbis-daily.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+```
+
+Проверка синтаксиса перед включением:
+
+```bash
+sudo systemd-analyze verify \
+    /etc/systemd/system/projectsbis-daily.service \
+    /etc/systemd/system/projectsbis-daily.timer
+```
+
+Включение автоматического запуска:
+
+```bash
+sudo systemctl enable --now projectsbis-daily.timer
+```
+
+Проверка расписания, состояния и журналов:
+
+```bash
+systemctl list-timers projectsbis-daily.timer
+systemctl is-enabled projectsbis-daily.timer
+systemctl is-active projectsbis-daily.timer
+systemctl status projectsbis-daily.timer --no-pager
+systemctl status projectsbis-daily.service --no-pager
+journalctl -u projectsbis-daily.service -n 100 --no-pager
+```
+
+Ручной запуск выполняет настоящую production-рассылку согласно `ExecStart`:
+
+```bash
+sudo systemctl start projectsbis-daily.service
+```
+
+Отключение автоматического запуска:
+
+```bash
+sudo systemctl disable --now projectsbis-daily.timer
+```
+
+Наличие unit-файлов в Git само по себе не означает, что timer установлен или
+включён на VPS. Это подтверждается только командами `is-enabled`, `is-active`
+и `list-timers` на production-сервере.
+
 ## 16. Типовые сценарии
 
 ### 16.1. Получить и обогатить выборку 5984
@@ -1122,7 +1187,7 @@ cd /opt/projectsbis/repository
 
 | Функция | Статус | Комментарий |
 |---|:---:|---|
-| Загрузка выборки СБИС | ⚠️ | Рабочий CLI есть, ежедневного запуска нет |
+| Загрузка выборки СБИС | ⚠️ | Входит в `src.daily_run`; установка и включение timer на VPS требуют проверки |
 | Поиск по одному/списку ИНН | ✅ | Рабочий CLI |
 | Обогащение | ✅ | Рабочий последовательный этап |
 | Инициализация default-кампании | ✅ | Выполняется из `initialize_database()` |
@@ -1142,22 +1207,24 @@ cd /opt/projectsbis/repository
 | Изоляция `tracking-test` | ✅ | `is_test=1`, статус получателя не меняется |
 | Изоляция `mock-send` | ❌ | Mock считается нетестовой отправкой |
 | Tracking systemd service | ✅ | Развёрнут на VPS, но unit не хранится в репозитории |
-| Daily orchestration | ❌ | Единой команды нет |
-| Daily итоговый отчёт | ❌ | Нет |
-| Scheduler/systemd timer daily | ❌ | В репозитории и подтверждённом workflow отсутствует |
-| Delivered/bounced ingestion | ❌ | Нет обработки Postfix logs/DSN |
+| Daily orchestration | ✅ | Единая команда `python -m src.daily_run` |
+| Daily итоговый отчёт | ✅ | Отправляется в конце полного production workflow |
+| Scheduler/systemd timer daily | ⚠️ | Unit-файлы есть в `deploy/`; установка и включение на VPS пока не подтверждены |
+| Delivered/bounced ingestion | ✅ | `src.daily_run` синхронизирует статусы по журналу Postfix |
 | Unsubscribe | ❌ | Endpoint и suppression-механизм отсутствуют |
 
-Минимальный будущий daily-оркестратор должен последовательно выполнить:
+Текущий daily-оркестратор последовательно выполняет:
 
 ```text
 initialize_database
+→ создание mail_run
 → синхронизация selection 5984
 → обогащение
 → populate_mail_recipients
-→ политика retry
 → отправка pending
-→ агрегированный итог запуска
+→ синхронизация delivered/bounced/deferred по Postfix
+→ daily report
+→ завершение mail_run с итоговыми счётчиками
 ```
 
 Tracking HTTP-service не следует запускать внутри daily-задачи: это отдельный
@@ -1167,8 +1234,8 @@ Tracking HTTP-service не следует запускать внутри daily-
 
 - `docs/PROJECT_WORKFLOW_v5.md` называет public tracking будущим этапом. Фактически
   open/click endpoints реализованы и end-to-end проверены на production VPS.
-- В документации ежедневный `systemd timer` описан как целевая схема. В текущем
-  репозитории daily-оркестратора, service и timer нет.
+- Daily-оркестратор и unit-файлы systemd находятся в репозитории. Их установка,
+  включение и следующий запуск timer должны подтверждаться отдельно на VPS.
 - `src/main.py` импортирует отсутствующую функцию конфигурации и использует старый
   интерфейс `get_contractor_card()`. Не используйте его.
 - `src/sbis/client_enrichment.py` и отдельный
