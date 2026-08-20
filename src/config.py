@@ -30,7 +30,7 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LOCAL_ENV_FILE = PROJECT_ROOT / ".env"
 REQUEST_FILE = PROJECT_ROOT / "config" / "request.json"
-
+    
 PRODUCTION_ENV_FILE = Path(
     "/etc/projectsbis/projectsbis.env"
 )
@@ -199,4 +199,8 @@ MAIL_SMTP_PASSWORD = optional_env(
 
 TEST_MAIL_EMAIL = optional_env(
     "TEST_MAIL_EMAIL"
+)
+
+DAILY_REPORT_EMAILS = optional_env(
+    "DAILY_REPORT_EMAILS"
 )

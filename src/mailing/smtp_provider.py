@@ -54,6 +54,31 @@ LOGO_PATH = (
 LOGO_CID = "atlantis-logo"
 
 
+@dataclass(slots=True)
+class MailAttachment:
+    """
+    Вложение для SMTP-письма.
+
+    Поля:
+        filename:
+            Имя файла, которое увидит получатель.
+
+        content:
+            Содержимое файла в байтах.
+
+        maintype:
+            Основной MIME-тип, например application.
+
+        subtype:
+            MIME-подтип, например
+            vnd.openxmlformats-officedocument.spreadsheetml.sheet.
+    """
+
+    filename: str
+    content: bytes
+    maintype: str
+    subtype: str
+
 class MailMessageLike(Protocol):
     """
     Минимальный интерфейс сообщения, который нужен SMTP-провайдеру.
@@ -67,6 +92,7 @@ class MailMessageLike(Protocol):
     subject: str
     text_body: str
     html_body: str
+    attachments: list[MailAttachment] | None
 
 
 @dataclass(slots=True)
@@ -303,6 +329,20 @@ class SMTPMailProvider:
             filename="atlantis-logo.png",
             disposition="inline",
         )
+        attachments = getattr(
+            message,
+            "attachments",
+            None,
+        )
+
+        if attachments:
+            for attachment in attachments:
+                email_message.add_attachment(
+                    attachment.content,
+                    maintype=attachment.maintype,
+                    subtype=attachment.subtype,
+                    filename=attachment.filename,
+                )
 
         tls_context = ssl.create_default_context()
 
