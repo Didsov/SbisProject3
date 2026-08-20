@@ -93,6 +93,7 @@ class MailMessageLike(Protocol):
     text_body: str
     html_body: str
     attachments: list[MailAttachment] | None
+    include_logo: bool
 
 
 @dataclass(slots=True)
@@ -307,28 +308,34 @@ class SMTPMailProvider:
             message.html_body,
             subtype="html",
         )
-        if not LOGO_PATH.exists():
-            return SMTPSendResult(
-                success=False,
-                provider_message_id=None,
-                error=(
-                    "Не найден логотип для email: "
-                    f"{LOGO_PATH}"
-                ),
-            )
-
-        logo_bytes = LOGO_PATH.read_bytes()
-
-        html_part = email_message.get_payload()[-1]
-
-        html_part.add_related(
-            logo_bytes,
-            maintype="image",
-            subtype="png",
-            cid=f"<{LOGO_CID}>",
-            filename="atlantis-logo.png",
-            disposition="inline",
+        include_logo = getattr(
+            message,
+            "include_logo",
+            True,
         )
+
+        if include_logo:
+            if not LOGO_PATH.exists():
+                return SMTPSendResult(
+                    success=False,
+                    provider_message_id=None,
+                    error=(
+                        "Не найден логотип для email: "
+                        f"{LOGO_PATH}"
+                    ),
+                )
+
+            logo_bytes = LOGO_PATH.read_bytes()
+
+            html_part = email_message.get_payload()[-1]
+
+            html_part.add_related(
+                logo_bytes,
+                maintype="image",
+                subtype="png",
+                cid=f"<{LOGO_CID}>",
+                disposition="inline",
+            )
         attachments = getattr(
             message,
             "attachments",

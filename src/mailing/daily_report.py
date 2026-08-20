@@ -56,6 +56,7 @@ class DailyReportMessage:
     text_body: str
     html_body: str
     attachments: list[MailAttachment] | None = None
+    include_logo: bool = False
 
 
 def get_campaign_delivery_rows(
