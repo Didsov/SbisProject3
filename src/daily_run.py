@@ -50,6 +50,7 @@ from src.client_loader import run as run_client_loader
 from src.database import (
     get_connection,
     get_or_create_mail_campaign,
+    initialize_database,
     populate_mail_recipients,
 )
 from src.mailing.daily_report import send_daily_report
@@ -226,8 +227,9 @@ def count_unresolved_messages(
             WHERE
                 mr.campaign_id = ?
                 AND mm.is_test = 0
-                AND mm.status IN (
-                    'sent',
+                AND mm.status = 'sent'
+                AND mm.delivery_status IN (
+                    'unknown',
                     'deferred'
                 )
             """,
@@ -249,7 +251,7 @@ async def wait_for_delivery_results(
     Периодически синхронизировать Postfix до получения
     финальных статусов либо окончания timeout.
 
-    Если часть писем остаётся deferred/sent,
+    Если часть писем остаётся deferred/unknown,
     daily-report покажет для них многоточие.
     """
     elapsed = 0
@@ -328,6 +330,10 @@ async def run_daily(
     print(
         f"Selection: {selection_id}"
     )
+
+    # Гарантирует применение повторяемых миграций mailing-схемы
+    # также в режиме --skip-load.
+    initialize_database()
 
     # ---------------------------------------------------------
     # 1. СБИС + ОБОГАЩЕНИЕ

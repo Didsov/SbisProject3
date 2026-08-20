@@ -926,7 +926,9 @@ def initialize_mailing_tables(
     - mail_messages:
         Хранит факт попытки отправки письма
         конкретному получателю и идентификатор
-        сообщения почтового провайдера.
+        сообщения почтового провайдера. Поле status
+        описывает SMTP-отправку, а delivery_status —
+        последующую доставку по данным Postfix.
 
     - mail_events:
         Хранит историю событий письма:
@@ -1028,6 +1030,8 @@ def initialize_mailing_tables(
 
             status TEXT NOT NULL DEFAULT 'pending',
 
+            delivery_status TEXT NOT NULL DEFAULT 'unknown',
+
             sent_at TEXT,
 
             created_at TEXT NOT NULL
@@ -1064,6 +1068,30 @@ def initialize_mailing_tables(
                 ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0
                 """
             )
+    if "delivery_status" not in message_columns:
+        connection.execute(
+            """
+            ALTER TABLE mail_messages
+            ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'unknown'
+            """
+        )
+
+    # До разделения статусов Postfix заменял SMTP-статус
+    # значениями delivered/deferred/bounced. Переносим эти значения
+    # в отдельную колонку без изменения остальных данных сообщения.
+    connection.execute(
+        """
+        UPDATE mail_messages
+        SET
+            delivery_status = status,
+            status = 'sent'
+        WHERE status IN (
+            'delivered',
+            'deferred',
+            'bounced'
+        )
+        """
+    )
 
     connection.execute(
         """
@@ -1158,6 +1186,14 @@ def initialize_mailing_tables(
         CREATE INDEX IF NOT EXISTS
             idx_mail_messages_status
         ON mail_messages(status)
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_mail_messages_delivery_status
+        ON mail_messages(delivery_status)
         """
     )
 
@@ -1632,6 +1668,7 @@ def get_mail_campaign_stats(
     Считает:
     - статусы получателей;
     - реально отправленные письма;
+    - отдельные статусы доставки Postfix;
     - открытия;
     - клики;
     - уникальные открытия и клики;
@@ -1646,22 +1683,30 @@ def get_mail_campaign_stats(
             "campaign_id должен быть больше 0"
         )
 
-    statuses = (
+    recipient_statuses = (
         "pending",
         "sent",
-        "delivered",
         "opened",
         "clicked",
-        "bounced",
         "failed",
         "unsubscribed",
+    )
+
+    delivery_statuses = (
+        "unknown",
+        "deferred",
+        "delivered",
+        "bounced",
     )
 
     stats: dict[str, int | float] = {
         "total": 0,
         **{
             status: 0
-            for status in statuses
+            for status in (
+                *recipient_statuses,
+                *delivery_statuses,
+            )
         },
         "messages_sent": 0,
         "opens_total": 0,
@@ -1724,6 +1769,34 @@ def get_mail_campaign_stats(
         )
 
         stats["messages_sent"] = messages_sent
+
+        delivery_rows = connection.execute(
+            """
+            SELECT
+                mm.delivery_status,
+                COUNT(*) AS count
+            FROM mail_messages AS mm
+
+            INNER JOIN mail_recipients AS mr
+                ON mr.id = mm.recipient_id
+
+            WHERE
+                mr.campaign_id = ?
+                AND mm.is_test = 0
+                AND mm.status = 'sent'
+
+            GROUP BY mm.delivery_status
+            """,
+            (campaign_id,),
+        ).fetchall()
+
+        for row in delivery_rows:
+            delivery_status = row["delivery_status"]
+
+            if delivery_status in delivery_statuses:
+                stats[delivery_status] = int(
+                    row["count"]
+                )
 
         event_row = connection.execute(
             """
@@ -2689,14 +2762,15 @@ def record_mail_delivery_status(
     Функция:
     - ищет mail_messages по provider_message_id;
     - не обрабатывает тестовые сообщения;
-    - обновляет только mail_messages.status;
+    - обновляет только mail_messages.delivery_status;
     - mail_recipients.status не изменяет;
     - сохраняет событие в mail_events;
     - повторная запись того же статуса не создаёт дубль события.
 
     Возвращает:
         True — письмо найдено;
-        False — письмо не найдено или является тестовым.
+        False — письмо не найдено, является тестовым
+        или не имеет SMTP-статус sent.
     """
     message_id_value = provider_message_id.strip()
 
@@ -2730,6 +2804,7 @@ def record_mail_delivery_status(
             SELECT
                 id,
                 status,
+                delivery_status,
                 is_test
             FROM mail_messages
             WHERE provider_message_id = ?
@@ -2745,9 +2820,14 @@ def record_mail_delivery_status(
         if message["is_test"]:
             return False
 
+        # Postfix может сообщить результат доставки только для письма,
+        # которое Python успешно передал нашему SMTP.
+        if message["status"] != "sent":
+            return False
+
         # delivered и bounced являются финальными состояниями.
         # Повторный проход по mail.log не должен откатывать их назад.
-        if message["status"] in {
+        if message["delivery_status"] in {
             "delivered",
             "bounced",
         }:
@@ -2755,13 +2835,15 @@ def record_mail_delivery_status(
 
         # Если этот статус уже был записан, повторное сканирование
         # логов не должно создавать дополнительное событие.
-        if message["status"] == delivery_status:
+        if message["delivery_status"] == delivery_status:
             return True
 
         connection.execute(
             """
             UPDATE mail_messages
-            SET status = ?
+            SET
+                delivery_status = ?,
+                updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
             (

@@ -37,6 +37,7 @@ from pathlib import Path
 
 from src.database import (
     get_connection,
+    initialize_database,
     record_mail_delivery_status,
 )
 
@@ -245,7 +246,8 @@ def get_messages_for_delivery_check(
     - provider='smtp';
     - is_test=0;
     - provider_message_id заполнен;
-    - status='sent' или 'deferred'.
+    - SMTP status='sent';
+    - delivery_status='unknown' или 'deferred'.
 
     delivered и bounced повторно анализировать не нужно.
     """
@@ -254,15 +256,17 @@ def get_messages_for_delivery_check(
             id,
             recipient_id,
             provider_message_id,
-            status
+            status,
+            delivery_status
         FROM mail_messages
         WHERE
             provider = 'smtp'
             AND is_test = 0
             AND provider_message_id IS NOT NULL
             AND TRIM(provider_message_id) <> ''
-            AND status IN (
-                'sent',
+            AND status = 'sent'
+            AND delivery_status IN (
+                'unknown',
                 'deferred'
             )
         ORDER BY id
@@ -421,6 +425,7 @@ def main() -> None:
     CLI-точка входа.
     """
     arguments = parse_arguments()
+    initialize_database()
 
     stats = synchronize_delivery_statuses(
         log_path=arguments.log,

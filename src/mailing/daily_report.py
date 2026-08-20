@@ -10,8 +10,8 @@
 - delivered -> ✓
 - bounced   -> ✕
 - failed    -> ✕
-- sent      -> …
 - deferred  -> …
+- unknown   -> …
 
 Отчёт отправляется:
 - HTML-таблицей в теле письма;
@@ -31,7 +31,10 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
 
 from src.config import DAILY_REPORT_EMAILS
-from src.database import get_connection
+from src.database import (
+    get_connection,
+    initialize_database,
+)
 from src.mailing.smtp_provider import (
     MailAttachment,
     SMTPMailProvider,
@@ -42,8 +45,8 @@ STATUS_SYMBOLS = {
     "delivered": "✓",
     "bounced": "✕",
     "failed": "✕",
-    "sent": "…",
     "deferred": "…",
+    "unknown": "…",
     "pending": "…",
 }
 
@@ -82,7 +85,16 @@ def get_campaign_delivery_rows(
                 mr.email,
                 COALESCE(
                     (
-                        SELECT mm.status
+                        SELECT
+                            CASE
+                                WHEN mm.status = 'failed'
+                                THEN 'failed'
+
+                                WHEN mm.status = 'sent'
+                                THEN mm.delivery_status
+
+                                ELSE mm.status
+                            END
                         FROM mail_messages AS mm
                         WHERE
                             mm.recipient_id = mr.id
@@ -474,6 +486,7 @@ def main() -> None:
     )
 
     arguments = parser.parse_args()
+    initialize_database()
 
     asyncio.run(
         send_daily_report(
