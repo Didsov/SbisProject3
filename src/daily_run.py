@@ -57,6 +57,10 @@ from src.database import (
     populate_mail_recipients,
     update_mail_run_counts,
 )
+from src.daily_lock import (
+    DailyRunAlreadyRunningError,
+    daily_run_lock,
+)
 from src.mailing.daily_report import send_daily_report
 from src.mailing.postfix_delivery import (
     synchronize_delivery_statuses,
@@ -74,6 +78,8 @@ DEFAULT_SEND_LIMIT = 1000
 
 DEFAULT_DELIVERY_WAIT_SECONDS = 60
 DEFAULT_DELIVERY_POLL_SECONDS = 5
+
+DAILY_RUN_ALREADY_RUNNING_EXIT_CODE = 3
 
 
 def refresh_mail_run_counts(
@@ -396,6 +402,27 @@ async def run_daily(
     delivery_wait: int,
     mail_log: Path,
 ) -> None:
+    """Выполнить daily workflow под единой межпроцессной блокировкой."""
+    with daily_run_lock():
+        await _run_daily_locked(
+            selection_id=selection_id,
+            skip_load=skip_load,
+            real_send=real_send,
+            limit=limit,
+            delivery_wait=delivery_wait,
+            mail_log=mail_log,
+        )
+
+
+async def _run_daily_locked(
+    *,
+    selection_id: int,
+    skip_load: bool,
+    real_send: bool,
+    limit: int,
+    delivery_wait: int,
+    mail_log: Path,
+) -> None:
     """
     Выполнить полный daily workflow.
     """
@@ -653,16 +680,22 @@ def main() -> None:
     """
     arguments = parse_arguments()
 
-    asyncio.run(
-        run_daily(
-            selection_id=arguments.selection,
-            skip_load=arguments.skip_load,
-            real_send=arguments.send,
-            limit=arguments.limit,
-            delivery_wait=arguments.delivery_wait,
-            mail_log=arguments.mail_log,
+    try:
+        asyncio.run(
+            run_daily(
+                selection_id=arguments.selection,
+                skip_load=arguments.skip_load,
+                real_send=arguments.send,
+                limit=arguments.limit,
+                delivery_wait=arguments.delivery_wait,
+                mail_log=arguments.mail_log,
+            )
         )
-    )
+    except DailyRunAlreadyRunningError as error:
+        print(error)
+        raise SystemExit(
+            DAILY_RUN_ALREADY_RUNNING_EXIT_CODE
+        ) from None
 
 
 if __name__ == "__main__":
