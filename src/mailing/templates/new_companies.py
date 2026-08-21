@@ -7,8 +7,8 @@
 - сформировать HTML-версию;
 - персонализировать письмо названием организации или ФИО ИП;
 - использовать фирменный стиль компании «Атлантис»;
-- подготовить HTML-структуру для дальнейшего подключения
-  click tracking, open tracking и unsubscribe.
+- формировать click-tracking ссылки и open-tracking pixel;
+- брать контактные destinations из централизованной конфигурации.
 
 Особенности HTML:
 - табличная верстка для совместимости с email-клиентами;
@@ -34,6 +34,16 @@ import html
 from textwrap import dedent
 from urllib.parse import quote
 
+from src.config import (
+    CONTACT_EMAIL,
+    CONTACT_MAX_URL,
+    CONTACT_PHONE_DISPLAY,
+    CONTACT_PHONE_URL,
+    CONTACT_TELEGRAM_URL,
+    CONTACT_WHATSAPP_URL,
+    build_contact_email_url,
+)
+
 
 # ---------------------------------------------------------------------------
 # Фирменные параметры
@@ -56,22 +66,6 @@ BORDER = "#E8EAED"
 LOGO_CID = "atlantis-logo"
 
 TRACKING_BASE_URL = "https://mail.projectsbis.ru"
-
-CONTACT_PHONE_DISPLAY = "7‒952‒080‒22‒20"
-CONTACT_PHONE_URL = "tel:+79520802220"
-
-WHATSAPP_URL = (
-    "https://wa.me/79520802220"
-    "?text=Обращение+из+почты%0A"
-    "Здравствуйте!+Меня+заинтересовало+ваше+предложение"
-)
-TELEGRAM_URL = "https://t.me/+79520802220"
-MAX_URL = "https://max.ru/id614023297728_bot"
-
-EMAIL_URL = (
-    "mailto:info@projectsbis.ru"
-    "?subject=Подбор%20решения%20для%20онлайн-кассы"
-)
 
 
 def build_click_url(
@@ -203,16 +197,16 @@ def build_text_body(
         уточним задачу и предложим подходящий вариант.
 
         Связаться с нами:
-        Телефон: 7-952-080-22-20
-        WhatsApp: https://wa.me/79520802220?text=Обращение+из+почты%0AЗдравствуйте!+Меня+заинтересовало+ваше+предложение
-        Telegram: https://t.me/+79520802220
-        MAX: https://max.ru/id614023297728_bot
+        Телефон: {CONTACT_PHONE_DISPLAY}
+        WhatsApp: {CONTACT_WHATSAPP_URL}
+        Telegram: {CONTACT_TELEGRAM_URL}
+        MAX: {CONTACT_MAX_URL}
 
         С уважением,
         Атлантис
         Автоматизация бизнеса
 
-        info@projectsbis.ru
+        {CONTACT_EMAIL}
         """
     ).strip()
 
@@ -274,10 +268,12 @@ def build_html_body(
             f"{tracking_token}.gif"
         )
 
+    # Имя click_key сохраняется для совместимости с накопленной
+    # аналитикой. Реальный destination основной CTA теперь WhatsApp.
     cta_email_url = build_click_url(
         tracking_token=tracking_token,
         click_key="cta_email",
-        direct_url=EMAIL_URL,
+        direct_url=CONTACT_WHATSAPP_URL,
     )
     phone_url = build_click_url(
         tracking_token=tracking_token,
@@ -287,17 +283,20 @@ def build_html_body(
     whatsapp_url = build_click_url(
         tracking_token=tracking_token,
         click_key="whatsapp",
-        direct_url=WHATSAPP_URL,
+        direct_url=CONTACT_WHATSAPP_URL,
     )
     telegram_url = build_click_url(
         tracking_token=tracking_token,
         click_key="telegram",
-        direct_url=TELEGRAM_URL,
+        direct_url=CONTACT_TELEGRAM_URL,
     )
     max_url = build_click_url(
         tracking_token=tracking_token,
         click_key="max",
-        direct_url=MAX_URL,
+        direct_url=CONTACT_MAX_URL,
+    )
+    email_url = build_contact_email_url(
+        CONTACT_EMAIL
     )
 
     safe_cta_email_url = html.escape(cta_email_url, quote=True)
@@ -305,6 +304,10 @@ def build_html_body(
     safe_whatsapp_url = html.escape(whatsapp_url, quote=True)
     safe_telegram_url = html.escape(telegram_url, quote=True)
     safe_max_url = html.escape(max_url, quote=True)
+    safe_email_url = html.escape(email_url, quote=True)
+    safe_contact_email = html.escape(
+        str(CONTACT_EMAIL or "")
+    )
 
     return dedent(
         f"""
@@ -1089,13 +1092,13 @@ def build_html_body(
                                         </a>
                                         <br>
                                         <a
-                                            href="mailto:info@projectsbis.ru"
+                                            href="{safe_email_url}"
                                             style="
                                                 color: {BRAND_CYAN};
                                                 text-decoration: none;
                                             "
                                         >
-                                            info@projectsbis.ru
+                                            {safe_contact_email}
                                         </a>
                                     </div>
 

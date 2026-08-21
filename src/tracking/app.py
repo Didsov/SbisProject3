@@ -5,17 +5,28 @@ HTTP-сервис отслеживания событий почтовой ра�
 - принимать запросы tracking pixel из отправленных писем;
 - находить письмо по tracking_token;
 - сохранять событие `opened` в mail_events;
-- возвращать прозрачный GIF 1x1.
+- возвращать прозрачный GIF 1x1;
+- фиксировать `clicked` и перенаправлять только на известные
+  контактные destinations из src.config.
 
-Публичный endpoint:
+Публичные endpoints:
     GET /t/o/<tracking_token>.gif
+    GET /t/c/<tracking_token>/<click_key>
 
 Tracking token является непрозрачным случайным идентификатором
 и не содержит email, ИНН или client_id.
 """
 
 from __future__ import annotations
+
 from aiohttp import web
+
+from src.config import (
+    CONTACT_MAX_URL,
+    CONTACT_PHONE_URL,
+    CONTACT_TELEGRAM_URL,
+    CONTACT_WHATSAPP_URL,
+)
 from src.database import record_mail_click, record_mail_open
 
 
@@ -32,18 +43,14 @@ TRANSPARENT_GIF = (
 
 
 CLICK_TARGETS = {
-    "cta_email": (
-        "mailto:info@projectsbis.ru"
-        "?subject=Подбор%20решения%20для%20онлайн-кассы"
-    ),
-    "phone": "tel:+79520802220",
-    "whatsapp": (
-        "https://wa.me/79520802220"
-        "?text=Обращение+из+почты%0A"
-        "Здравствуйте!+Меня+заинтересовало+ваше+предложение"
-    ),
-    "telegram": "https://t.me/+79520802220",
-    "max": "https://max.ru/id614023297728_bot",
+    # cta_email — исторический ключ аналитики основной кнопки.
+    # Его нельзя переименовывать в старых и новых письмах, хотя
+    # фактический destination теперь совпадает с WhatsApp.
+    "cta_email": CONTACT_WHATSAPP_URL,
+    "phone": CONTACT_PHONE_URL,
+    "whatsapp": CONTACT_WHATSAPP_URL,
+    "telegram": CONTACT_TELEGRAM_URL,
+    "max": CONTACT_MAX_URL,
 }
 
 
@@ -73,7 +80,12 @@ def process_click_tracking(
 
     Примечание:
         Реальный URL не принимается из пользовательского запроса.
-        Это защищает endpoint от превращения в открытый redirect.
+        Он выбирается только из фиксированного словаря конфигурации,
+        что защищает endpoint от превращения в открытый redirect.
+
+        Результат record_mail_click намеренно не влияет на redirect:
+        неизвестный старый token не приводит к HTTP 500 и всё равно
+        открывает безопасный destination известного click_key.
     """
     target_url = CLICK_TARGETS.get(click_key)
 

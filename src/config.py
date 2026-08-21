@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from urllib.parse import quote, urlencode
 
 from dotenv import load_dotenv
 
@@ -169,7 +170,7 @@ SBIS_SELECTION_ID = int(
 
 MAIL_FROM_EMAIL = optional_env(
     "MAIL_FROM_EMAIL",
-    "info@projectsbis.ru",
+    "info@atlantis.ooo",
 )
 
 MAIL_FROM_NAME = optional_env(
@@ -209,3 +210,71 @@ ADMIN_PUBLIC_URL = optional_env(
     "ADMIN_PUBLIC_URL",
     "https://mail.projectsbis.ru/admin",
 )
+
+CONTACT_PHONE_DISPLAY = optional_env(
+    "CONTACT_PHONE_DISPLAY",
+    "7‒952‒080‒22‒20",
+)
+
+CONTACT_PHONE_URL = optional_env(
+    "CONTACT_PHONE_URL",
+    "tel:+79520802220",
+)
+
+CONTACT_WHATSAPP_URL = optional_env(
+    "CONTACT_WHATSAPP_URL",
+    (
+        "https://wa.me/79520802220?"
+        + urlencode(
+            {
+                "text": (
+                    "Обращение из почты\n"
+                    "Здравствуйте! Меня заинтересовало "
+                    "ваше предложение"
+                )
+            }
+        )
+    ),
+)
+
+CONTACT_TELEGRAM_URL = optional_env(
+    "CONTACT_TELEGRAM_URL",
+    "https://t.me/+79520802220",
+)
+
+CONTACT_MAX_URL = optional_env(
+    "CONTACT_MAX_URL",
+    "https://max.ru/id614023297728_bot",
+)
+
+CONTACT_EMAIL = optional_env(
+    "CONTACT_EMAIL",
+    MAIL_FROM_EMAIL,
+)
+
+
+def build_contact_email_url(
+    email: str | None = None,
+) -> str:
+    """
+    Сформировать безопасный mailto URL для отдельной email-ссылки.
+
+    По умолчанию используется CONTACT_EMAIL, который наследует
+    MAIL_FROM_EMAIL. Адрес и тема кодируются как части URL; HTML-слой
+    дополнительно обязан экранировать готовый URL перед вставкой в href.
+    """
+    clean_email = str(
+        email or CONTACT_EMAIL or ""
+    ).strip()
+    safe_email = quote(
+        clean_email,
+        safe="@+._-",
+    )
+    query = urlencode(
+        {
+            "subject": (
+                "Подбор решения для онлайн-кассы"
+            )
+        }
+    )
+    return f"mailto:{safe_email}?{query}"
