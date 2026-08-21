@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from datetime import datetime
 from html import escape
+import json
 from typing import Iterable, Mapping, Sequence
 
 from aiohttp import web
 
 from src.database import (
     get_latest_mail_run_with_sent_messages,
+    get_mail_message_details,
+    get_mail_message_timeline,
     get_mail_run_details,
     get_mail_run_events,
     get_mail_run_messages,
@@ -145,6 +148,11 @@ SEND_STATUSES = {
     "failed": ("✕", "failed"),
     "pending": ("…", "pending"),
 }
+MESSAGE_SEND_STATUSES = {
+    "sent": ("✓ Отправлено", "sent"),
+    "failed": ("✕ Ошибка SMTP", "failed"),
+    "pending": ("… Ожидание", "pending"),
+}
 DELIVERY_STATUSES = {
     "delivered": ("✓ Принято", "delivered"),
     "bounced": ("✕ Bounce", "bounced"),
@@ -158,6 +166,13 @@ EVENT_STATUSES = {
     "deferred": ("Временная ошибка", "deferred"),
     "opened": ("Открыто", "opened"),
     "clicked": ("Клик", "clicked"),
+}
+CLICK_CHANNEL_LABELS = {
+    "phone": "Phone",
+    "whatsapp": "WhatsApp",
+    "telegram": "Telegram",
+    "max": "MAX",
+    "cta_email": "Email",
 }
 
 
@@ -224,12 +239,57 @@ def _send_status(value: object) -> str:
     return _badge(value, SEND_STATUSES)
 
 
+def _message_send_status(value: object) -> str:
+    return _badge(value, MESSAGE_SEND_STATUSES)
+
+
 def _delivery_status(value: object) -> str:
     return _badge(value, DELIVERY_STATUSES)
 
 
 def _event_status(value: object) -> str:
     return _badge(value, EVENT_STATUSES)
+
+
+def _click_channel(event_data: object) -> str | None:
+    """Извлечь известный канал клика из JSON event_data."""
+    if isinstance(event_data, str):
+        try:
+            parsed_data = json.loads(event_data)
+        except (TypeError, ValueError):
+            return None
+    elif isinstance(event_data, Mapping):
+        parsed_data = event_data
+    else:
+        return None
+
+    if not isinstance(parsed_data, Mapping):
+        return None
+
+    for field_name in ("click_key", "channel", "key"):
+        raw_channel = parsed_data.get(field_name)
+        channel = str(raw_channel or "").strip().lower()
+        if channel in CLICK_CHANNEL_LABELS:
+            return CLICK_CHANNEL_LABELS[channel]
+
+    return None
+
+
+def _message_event_status(
+    event_type: object,
+    event_data: object,
+) -> str:
+    """Отобразить событие сообщения с каналом распознанного клика."""
+    if event_type == "clicked":
+        channel = _click_channel(event_data)
+        if channel is not None:
+            return (
+                '<span class="status status-clicked">'
+                f"Клик · {escape(channel)}"
+                "</span>"
+            )
+
+    return _event_status(event_type)
 
 
 def _duration(started_at: object, finished_at: object) -> str:
@@ -526,6 +586,24 @@ def _parse_run_id(request: web.Request) -> int:
     return run_id
 
 
+def _parse_message_id(request: web.Request) -> int:
+    """Проверить message_id из маршрута."""
+    raw_message_id = request.match_info.get("message_id", "")
+    try:
+        message_id = int(raw_message_id)
+    except ValueError:
+        raise web.HTTPBadRequest(
+            text="Некорректный message_id.",
+            content_type="text/plain",
+        ) from None
+    if message_id < 1:
+        raise web.HTTPBadRequest(
+            text="Некорректный message_id.",
+            content_type="text/plain",
+        )
+    return message_id
+
+
 async def handle_run_details(request: web.Request) -> web.Response:
     """Показать запуск, его сообщения и последние события."""
     run_id = _parse_run_id(request)
@@ -555,7 +633,11 @@ async def handle_run_details(request: web.Request) -> web.Response:
         rows=(
             (
                 (
-                    _value(message["company_name"]),
+                    (
+                        '<a class="text-link" '
+                        f'href="/admin/messages/{int(message["message_id"])}">'
+                        f'{_value(message["company_name"])}</a>'
+                    ),
                     f'<span class="email">{_value(message["email"])}</span>',
                     _send_status(message["send_status"]),
                     _delivery_status(message["delivery_status"]),
@@ -621,12 +703,129 @@ async def handle_run_details(request: web.Request) -> web.Response:
     return _response(title=f"Запуск #{run_id}", content=content)
 
 
+async def handle_message_details(
+    request: web.Request,
+) -> web.Response:
+    """Показать одно сообщение и его хронологию событий."""
+    message_id = _parse_message_id(request)
+    details = get_mail_message_details(message_id)
+
+    if details is None:
+        raise web.HTTPNotFound(
+            text="Сообщение не найдено.",
+            content_type="text/plain",
+        )
+
+    timeline = get_mail_message_timeline(message_id)
+    run_id = details["run_id"]
+
+    if run_id is None:
+        back_link = (
+            '<a class="text-link" href="/admin/runs">'
+            "← К списку запусков</a>"
+        )
+    else:
+        safe_run_id = int(run_id)
+        back_link = (
+            '<a class="text-link" '
+            f'href="/admin/runs/{safe_run_id}">'
+            f"← К запуску #{safe_run_id}</a>"
+        )
+
+    timeline_table = _table(
+        headers=("Время", "Событие", "Детали"),
+        rows=(
+            (
+                (
+                    _value(event["event_at"]),
+                    _message_event_status(
+                        event["event_type"],
+                        event["event_data"],
+                    ),
+                    _event_data(event["event_data"]),
+                ),
+                None,
+            )
+            for event in timeline
+        ),
+        empty_text="У сообщения нет событий.",
+    )
+    summary = _details(
+        (
+            ("Компания", _value(details["company_name"])),
+            (
+                "Email",
+                f'<span class="email">{_value(details["email"])}</span>',
+            ),
+            ("Кампания", _value(details["campaign_name"])),
+            ("Run ID", _value(details["run_id"])),
+            ("Message ID", _value(details["message_id"])),
+            (
+                "Статус отправки",
+                _message_send_status(details["send_status"]),
+            ),
+            (
+                "Статус доставки",
+                _delivery_status(details["delivery_status"]),
+            ),
+            ("Отправлено", _value(details["sent_at"])),
+            ("Открытий", _value(details["opened_count"])),
+            ("Кликов", _value(details["clicked_count"])),
+            ("Последнее событие", _value(details["last_event_at"])),
+        )
+    )
+    technical_details = (
+        '<details class="event-data run-card">'
+        "<summary>Технические данные</summary>"
+        '<section class="panel run-card">'
+        + _details(
+            (
+                ("Provider", _value(details["provider"])),
+                (
+                    "Provider message ID",
+                    _value(details["provider_message_id"]),
+                ),
+                (
+                    "Tracking token",
+                    _value(details["tracking_token"]),
+                ),
+                ("Client ID", _value(details["client_id"])),
+                ("Campaign ID", _value(details["campaign_id"])),
+            )
+        )
+        + "</section></details>"
+    )
+    content = (
+        back_link
+        + '<div class="page-heading run-card">'
+        + '<div class="eyebrow">История сообщения</div>'
+        + f"<h1>Сообщение #{message_id}</h1>"
+        + '<p class="subtitle">Отправка, доставка и реакции получателя.</p>'
+        + "</div>"
+        + '<section class="panel">'
+        + summary
+        + "</section>"
+        + technical_details
+        + "<h2>История событий</h2>"
+        + timeline_table
+    )
+
+    return _response(
+        title=f"Сообщение #{message_id}",
+        content=content,
+    )
+
+
 def create_app() -> web.Application:
     """Создать read-only aiohttp-приложение админки."""
     app = web.Application()
     app.router.add_get("/admin", handle_admin)
     app.router.add_get("/admin/runs", handle_runs)
     app.router.add_get("/admin/runs/{run_id}", handle_run_details)
+    app.router.add_get(
+        "/admin/messages/{message_id}",
+        handle_message_details,
+    )
     return app
 
 

@@ -58,6 +58,55 @@ MESSAGES = [
     },
 ]
 
+MESSAGE_DETAILS = {
+    "message_id": 21,
+    "run_id": 7,
+    "campaign_id": 3,
+    "campaign_name": "Campaign <unsafe>",
+    "client_id": 11,
+    "company_name": "Company <One>",
+    "email": "one@example.invalid",
+    "provider": "smtp",
+    "provider_message_id": "provider-<unsafe>",
+    "send_status": "sent",
+    "delivery_status": "delivered",
+    "sent_at": "2026-08-20 09:01:00",
+    "tracking_token": "token-<unsafe>",
+    "opened_count": 2,
+    "clicked_count": 1,
+    "last_event_at": "2026-08-20 09:05:00",
+}
+
+MESSAGE_TIMELINE = [
+    {
+        "event_id": 40,
+        "event_type": "sent",
+        "event_at": "2026-08-20 09:01:00",
+        "event_data": None,
+    },
+    {
+        "event_id": 41,
+        "event_type": "delivered",
+        "event_at": "2026-08-20 09:02:00",
+        "event_data": None,
+    },
+    {
+        "event_id": 42,
+        "event_type": "opened",
+        "event_at": "2026-08-20 09:04:00",
+        "event_data": None,
+    },
+    {
+        "event_id": 43,
+        "event_type": "clicked",
+        "event_at": "2026-08-20 09:05:00",
+        "event_data": (
+            '{"click_key":"whatsapp",'
+            '"unsafe":"<script>alert(1)</script>"}'
+        ),
+    },
+]
+
 EVENTS = [
     {
         "event_id": 31,
@@ -98,12 +147,24 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
             "get_mail_run_events",
             return_value=EVENTS,
         )
+        self.message_details_patcher = patch.object(
+            admin_app,
+            "get_mail_message_details",
+            return_value=MESSAGE_DETAILS,
+        )
+        self.message_timeline_patcher = patch.object(
+            admin_app,
+            "get_mail_message_timeline",
+            return_value=MESSAGE_TIMELINE,
+        )
 
         self.get_recent = self.recent_patcher.start()
         self.get_latest_mailing = self.latest_mailing_patcher.start()
         self.get_details = self.details_patcher.start()
         self.get_messages = self.messages_patcher.start()
         self.get_events = self.events_patcher.start()
+        self.get_message_details = self.message_details_patcher.start()
+        self.get_message_timeline = self.message_timeline_patcher.start()
 
         self.client = TestClient(
             TestServer(admin_app.create_app())
@@ -112,6 +173,8 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self) -> None:
         await self.client.close()
+        self.message_timeline_patcher.stop()
+        self.message_details_patcher.stop()
         self.events_patcher.stop()
         self.messages_patcher.stop()
         self.details_patcher.stop()
@@ -134,6 +197,7 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
                 ("GET", "/admin"),
                 ("GET", "/admin/runs"),
                 ("GET", "/admin/runs/{run_id}"),
+                ("GET", "/admin/messages/{message_id}"),
             },
         )
 
@@ -228,6 +292,10 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Ошибки SMTP", page_html)
         self.assertIn("Последние события", page_html)
         self.assertIn("Клик", page_html)
+        self.assertIn(
+            'href="/admin/messages/21"',
+            page_html,
+        )
         self.assertIn('<details class="event-data">', page_html)
         self.assertIn("<summary>Данные</summary>", page_html)
         self.assertIn(
@@ -238,6 +306,98 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
         self.get_details.assert_called_once_with(7)
         self.get_messages.assert_called_once_with(7)
         self.get_events.assert_called_once_with(7)
+
+    async def test_message_details_contains_timeline_and_channel(
+        self,
+    ) -> None:
+        response = await self.client.get(
+            "/admin/messages/21"
+        )
+        page_html = await response.text()
+
+        self.assertEqual(response.status, 200)
+        for label in (
+            "Компания",
+            "Email",
+            "Кампания",
+            "Run ID",
+            "Message ID",
+            "Статус отправки",
+            "Статус доставки",
+            "Отправлено",
+            "Открытий",
+            "Кликов",
+            "Последнее событие",
+            "История событий",
+        ):
+            self.assertIn(label, page_html)
+        self.assertIn("✓ Отправлено", page_html)
+        self.assertIn("✓ Принято", page_html)
+        self.assertIn("Открыто", page_html)
+        self.assertIn("Клик · WhatsApp", page_html)
+        self.assertLess(
+            page_html.index("Открыто"),
+            page_html.index("Клик · WhatsApp"),
+        )
+        self.assertIn(
+            'href="/admin/runs/7"',
+            page_html,
+        )
+        self.assertIn("← К запуску #7", page_html)
+        self.assertIn("Технические данные", page_html)
+        self.assertIn("provider-&lt;unsafe&gt;", page_html)
+        self.assertIn("token-&lt;unsafe&gt;", page_html)
+        self.assertIn(
+            "&lt;script&gt;alert(1)&lt;/script&gt;",
+            page_html,
+        )
+        self.assertNotIn("<script>alert(1)</script>", page_html)
+        self.assertIn('<details class="event-data">', page_html)
+        self.get_message_details.assert_called_once_with(21)
+        self.get_message_timeline.assert_called_once_with(21)
+
+    async def test_message_without_run_links_to_runs_list(self) -> None:
+        self.get_message_details.return_value = {
+            **MESSAGE_DETAILS,
+            "run_id": None,
+        }
+
+        response = await self.client.get(
+            "/admin/messages/21"
+        )
+        page_html = await response.text()
+
+        self.assertEqual(response.status, 200)
+        self.assertIn('href="/admin/runs"', page_html)
+        self.assertIn("← К списку запусков", page_html)
+
+    async def test_missing_message_returns_404(self) -> None:
+        self.get_message_details.return_value = None
+
+        response = await self.client.get(
+            "/admin/messages/999"
+        )
+
+        self.assertEqual(response.status, 404)
+        self.assertEqual(
+            await response.text(),
+            "Сообщение не найдено.",
+        )
+        self.get_message_details.assert_called_once_with(999)
+        self.get_message_timeline.assert_not_called()
+
+    async def test_invalid_message_id_returns_400(self) -> None:
+        response = await self.client.get(
+            "/admin/messages/not-a-number"
+        )
+
+        self.assertEqual(response.status, 400)
+        self.assertEqual(
+            await response.text(),
+            "Некорректный message_id.",
+        )
+        self.get_message_details.assert_not_called()
+        self.get_message_timeline.assert_not_called()
 
     async def test_dashboard_without_prior_mailing_keeps_latest_run(
         self,
@@ -322,6 +482,16 @@ class AdminAppPresentationTestCase(unittest.TestCase):
             (admin_app._run_status, "running", "… Выполняется"),
             (admin_app._send_status, "sent", "✓"),
             (admin_app._send_status, "failed", "✕"),
+            (
+                admin_app._message_send_status,
+                "sent",
+                "✓ Отправлено",
+            ),
+            (
+                admin_app._message_send_status,
+                "failed",
+                "✕ Ошибка SMTP",
+            ),
             (admin_app._delivery_status, "delivered", "✓ Принято"),
             (admin_app._delivery_status, "bounced", "✕ Bounce"),
             (admin_app._delivery_status, "deferred", "… Ожидание"),
@@ -350,6 +520,29 @@ class AdminAppPresentationTestCase(unittest.TestCase):
         self.assertIn("○ Нет новых получателей", rendered)
         self.assertNotIn("✓ Успешно", rendered)
         self.assertEqual(EMPTY_RUN["status"], "success")
+
+    def test_known_click_channels_are_human_readable(self) -> None:
+        channels = {
+            "phone": "Phone",
+            "whatsapp": "WhatsApp",
+            "telegram": "Telegram",
+            "max": "MAX",
+            "cta_email": "Email",
+        }
+
+        for click_key, label in channels.items():
+            with self.subTest(click_key=click_key):
+                rendered = admin_app._message_event_status(
+                    "clicked",
+                    f'{{"click_key":"{click_key}"}}',
+                )
+                self.assertIn(f"Клик · {label}", rendered)
+
+        unknown = admin_app._message_event_status(
+            "clicked",
+            '{"click_key":"unknown"}',
+        )
+        self.assertIn(">Клик</span>", unknown)
 
 
 if __name__ == "__main__":
