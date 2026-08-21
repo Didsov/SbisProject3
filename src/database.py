@@ -2667,6 +2667,125 @@ def get_mail_run_events(
     ]
 
 
+def get_mail_message_details(
+    message_id: int,
+) -> dict[str, object] | None:
+    """Получить одно сообщение с адресатом и engagement-счётчиками."""
+    if message_id < 1:
+        raise ValueError(
+            "message_id должен быть больше 0"
+        )
+
+    with closing(get_connection()) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                mm.id AS message_id,
+                mm.run_id,
+                mr.campaign_id,
+                mc.name AS campaign_name,
+                mr.client_id,
+                c.name AS company_name,
+                mr.email,
+                mm.provider,
+                mm.provider_message_id,
+                mm.status AS send_status,
+                mm.delivery_status,
+                mm.sent_at,
+                mm.tracking_token,
+                SUM(
+                    CASE
+                        WHEN me.event_type = 'opened'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS opened_count,
+                SUM(
+                    CASE
+                        WHEN me.event_type = 'clicked'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS clicked_count,
+                MAX(me.event_at) AS last_event_at
+            FROM mail_messages AS mm
+
+            INNER JOIN mail_recipients AS mr
+                ON mr.id = mm.recipient_id
+
+            INNER JOIN mail_campaigns AS mc
+                ON mc.id = mr.campaign_id
+
+            INNER JOIN clients AS c
+                ON c.id = mr.client_id
+
+            LEFT JOIN mail_events AS me
+                ON me.message_id = mm.id
+
+            WHERE mm.id = ?
+
+            GROUP BY
+                mm.id,
+                mm.run_id,
+                mr.campaign_id,
+                mc.name,
+                mr.client_id,
+                c.name,
+                mr.email,
+                mm.provider,
+                mm.provider_message_id,
+                mm.status,
+                mm.delivery_status,
+                mm.sent_at,
+                mm.tracking_token
+            """,
+            (message_id,),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    details = dict(row)
+    details["opened_count"] = int(
+        details["opened_count"] or 0
+    )
+    details["clicked_count"] = int(
+        details["clicked_count"] or 0
+    )
+    return details
+
+
+def get_mail_message_timeline(
+    message_id: int,
+) -> list[dict[str, object]]:
+    """Получить хронологию событий одного сообщения, включая тестовое."""
+    if message_id < 1:
+        raise ValueError(
+            "message_id должен быть больше 0"
+        )
+
+    with closing(get_connection()) as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                id AS event_id,
+                event_type,
+                event_at,
+                event_data
+            FROM mail_events
+            WHERE message_id = ?
+            ORDER BY
+                event_at,
+                id
+            """,
+            (message_id,),
+        ).fetchall()
+
+    return [
+        dict(row)
+        for row in rows
+    ]
+
 
 def create_mail_message(
     *,
