@@ -161,6 +161,10 @@ SBIS_BROWSER_COOKIE = optional_env(
     "SBIS_BROWSER_COOKIE"
 )
 
+SBIS_AUTH_ALERT_EMAILS = optional_env(
+    "SBIS_AUTH_ALERT_EMAILS"
+)
+
 SBIS_SELECTION_ID = int(
     optional_env(
         "SBIS_SELECTION_ID",

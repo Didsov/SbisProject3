@@ -66,6 +66,11 @@ from src.mailing.postfix_delivery import (
     synchronize_delivery_statuses,
 )
 from src.mailing.sender import run_sender
+from src.sbis.auth import (
+    SbisAuthCheckResult,
+    check_sbis_browser_cookie,
+)
+from src.sbis.auth_alert import send_sbis_auth_alert
 
 
 DEFAULT_SELECTION_ID = 5984
@@ -80,6 +85,27 @@ DEFAULT_DELIVERY_WAIT_SECONDS = 60
 DEFAULT_DELIVERY_POLL_SECONDS = 5
 
 DAILY_RUN_ALREADY_RUNNING_EXIT_CODE = 3
+SBIS_AUTH_INVALID_EXIT_CODE = 2
+SBIS_AUTH_CHECK_ERROR_EXIT_CODE = 1
+
+
+class SbisAuthPreflightError(RuntimeError):
+    """Daily workflow остановлен до работы с БД и рассылкой."""
+
+    def __init__(
+        self,
+        result: SbisAuthCheckResult,
+    ) -> None:
+        self.result = result
+        if result.is_invalid_auth:
+            message = "Авторизация СБИС недействительна"
+        else:
+            message = "Не удалось проверить авторизацию СБИС"
+
+        if result.http_status is not None:
+            message += f" (HTTP {result.http_status})"
+
+        super().__init__(message)
 
 
 def refresh_mail_run_counts(
@@ -404,6 +430,7 @@ async def run_daily(
 ) -> None:
     """Выполнить daily workflow под единой межпроцессной блокировкой."""
     with daily_run_lock():
+        await run_sbis_auth_preflight()
         await _run_daily_locked(
             selection_id=selection_id,
             skip_load=skip_load,
@@ -412,6 +439,63 @@ async def run_daily(
             delivery_wait=delivery_wait,
             mail_log=mail_log,
         )
+
+
+async def run_sbis_auth_preflight() -> SbisAuthCheckResult:
+    """
+    Подтвердить авторизацию до загрузки selection, БД и рассылки.
+
+    Для invalid auth отправляется отдельное служебное уведомление.
+    Его ошибка журналируется, но исходный auth failure остаётся причиной
+    остановки daily run.
+    """
+    print("Проверка SBIS_BROWSER_COOKIE...")
+    result = await check_sbis_browser_cookie()
+
+    if result.is_valid:
+        print("SBIS_BROWSER_COOKIE: OK")
+        return result
+
+    if result.is_invalid_auth:
+        status_text = (
+            f"HTTP {result.http_status}"
+            if result.http_status is not None
+            else "HTTP status не получен"
+        )
+        print(
+            "SBIS_BROWSER_COOKIE: INVALID "
+            f"({status_text})."
+        )
+        print(
+            "Daily run остановлен до загрузки selection. "
+            "Рассылка не выполнялась."
+        )
+
+        try:
+            await send_sbis_auth_alert(result)
+        except Exception as alert_error:
+            print(
+                "Не удалось отправить auth-alert; "
+                "исходная ошибка авторизации сохранена: "
+                f"{type(alert_error).__name__}"
+            )
+
+        raise SbisAuthPreflightError(result)
+
+    status_text = (
+        f"HTTP {result.http_status}"
+        if result.http_status is not None
+        else result.error_type or "неизвестная ошибка"
+    )
+    print(
+        "SBIS_BROWSER_COOKIE: CHECK ERROR "
+        f"({status_text})."
+    )
+    print(
+        "Daily run остановлен: отличить сетевую/серверную ошибку "
+        "от успешной авторизации невозможно. Рассылка не выполнялась."
+    )
+    raise SbisAuthPreflightError(result)
 
 
 async def _run_daily_locked(
@@ -696,6 +780,13 @@ def main() -> None:
         print(error)
         raise SystemExit(
             DAILY_RUN_ALREADY_RUNNING_EXIT_CODE
+        ) from None
+    except SbisAuthPreflightError as error:
+        print(error)
+        raise SystemExit(
+            SBIS_AUTH_INVALID_EXIT_CODE
+            if error.result.is_invalid_auth
+            else SBIS_AUTH_CHECK_ERROR_EXIT_CODE
         ) from None
 
 
