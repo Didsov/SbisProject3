@@ -67,6 +67,7 @@ Tracking-сервис работает отдельно и должен быть
 | Поиск по ИНН | Найти точный `SppUuid` через `Contractor.SearchSuggest` | `src/client_loader.py`, `src/sbis/company_search.py` |
 | Обогащение | Получить `ContractorCard.Read`, извлечь реквизиты, директора и контакты | `src/sbis/contractor_card.py`, `src/sbis/card_parser.py` |
 | Декодирование СБИС | Преобразовать внутренние структуры `d/s` в dict/list | `src/sbis/records.py`, `src/sbis/pagination.py` |
+| Контроль авторизации СБИС | Проверить browser cookie, остановить daily run и отправить один alert на эпизод | `src/sbis/auth.py`, `auth_state.py`, `auth_monitor.py`, `cookie_manager.py` |
 | SQLite | Схема, миграции, клиенты, кампании, сообщения, события и метрики | `src/database.py` |
 | Источники клиентов | Связать клиента с выборкой или входным списком ИНН | `client_selections`, `client_sources` в `src/database.py` |
 | Почтовая очередь | Создать кампанию и наполнить получателей | `get_or_create_mail_campaign()`, `populate_mail_recipients()` |
@@ -101,6 +102,12 @@ ProjectSbis/
 │   ├── selection_full_clients.sql
 │   ├── selections_summary.sql
 │   └── source_full_clients.sql
+├── deploy/
+│   ├── projectsbis-daily.service
+│   ├── projectsbis-daily.timer
+│   ├── projectsbis-admin.service
+│   ├── projectsbis-sbis-auth-check.service
+│   └── projectsbis-sbis-auth-check.timer
 └── src/
     ├── client_loader.py         # рабочий CLI загрузки и обогащения
     ├── config.py                # конфигурация и пути
@@ -116,6 +123,11 @@ ProjectSbis/
     │       ├── registry.py
     │       └── new_companies.py
     ├── sbis/
+    │   ├── auth.py              # безопасная HTTP-проверка browser cookie
+    │   ├── auth_alert.py        # отдельное служебное SMTP-уведомление
+    │   ├── auth_monitor.py      # единая state machine hourly/daily
+    │   ├── auth_state.py        # атомарный JSON state + OS-level lock
+    │   ├── cookie_manager.py    # проверка и безопасная замена cookie
     │   ├── client.py
     │   ├── client_list.py
     │   ├── company_search.py
@@ -150,6 +162,7 @@ ProjectSbis/
 | Репозиторий | `D:\GIT\ProjectSbis` | `/opt/projectsbis/repository` |
 | Python | `python` после активации `.venv` | `/opt/projectsbis/repository/.venv/bin/python` |
 | БД | `D:\GIT\ProjectSbis\data\project.db` | `/var/lib/projectsbis/project.db` |
+| SBIS auth-state | `D:\GIT\ProjectSbis\data\sbis_auth_state.json` | `/var/lib/projectsbis/sbis_auth_state.json` |
 | ENV | `D:\GIT\ProjectSbis\.env` | `/etc/projectsbis/projectsbis.env` |
 | Шаблон запроса СБИС | `config/request.json` | `/opt/projectsbis/repository/config/request.json` |
 | XLSX | `exports/` | `exports/` выбранного checkout либо `--output` |
@@ -165,6 +178,8 @@ ProjectSbis/
 |---|---|---|
 | `PROJECT_DB_PATH` | рекомендована на VPS | Путь к SQLite |
 | `SBIS_BROWSER_COOKIE` | обязательна для live-запросов СБИС | Cookie авторизованной браузерной сессии |
+| `SBIS_AUTH_ALERT_EMAILS` | нужна для auth-alert | Отдельный список служебных получателей через запятую; fallback на `DAILY_REPORT_EMAILS` отсутствует |
+| `SBIS_AUTH_STATE_PATH` | необязательна | Общий JSON state hourly/daily; Linux default `/var/lib/projectsbis/sbis_auth_state.json` |
 | `SBIS_URL` | необязательна | RPC endpoint, по умолчанию `https://online.sbis.ru/service/` |
 | `SBIS_SELECTION_ID` | фактически нужна загрузке выборки | Сейчас дополнительно проверяется в `src/sbis/client.py`, хотя выборка уже передаётся через CLI |
 | `MAIL_FROM_EMAIL` | имеет default | Адрес отправителя |
@@ -180,10 +195,12 @@ ProjectSbis/
 ```env
 PROJECT_DB_PATH=/var/lib/projectsbis/project.db
 SBIS_BROWSER_COOKIE=...
+SBIS_AUTH_ALERT_EMAILS=suglobovdima@ya.ru
+SBIS_AUTH_STATE_PATH=/var/lib/projectsbis/sbis_auth_state.json
 SBIS_SELECTION_ID=5984
 SBIS_URL=https://online.sbis.ru/service/
 
-MAIL_FROM_EMAIL=info@projectsbis.ru
+MAIL_FROM_EMAIL=info@atlantis.ooo
 MAIL_FROM_NAME=Атлантис
 MAIL_SMTP_HOST=mail.projectsbis.ru
 MAIL_SMTP_PORT=587
@@ -1058,6 +1075,144 @@ sudo systemctl disable --now projectsbis-admin.service
 Наличие unit-файла и этих команд в Git не означает, что сервис уже установлен
 или запущен на VPS. Это проверяется только через `systemctl` на сервере.
 
+### 15.8. Почасовой контроль SBIS_BROWSER_COOKIE
+
+`Contractor.SearchSuggest` использует браузерную cookie СБИС. Для раннего
+обнаружения HTTP 401/403 есть отдельная безопасная проверка, которая не читает
+клиентов из БД и не изменяет БД:
+
+```bash
+cd /opt/projectsbis/repository
+sudo .venv/bin/python -m src.sbis.cookie_manager --check
+```
+
+Exit codes:
+
+- `0` — cookie подтверждена как valid;
+- `2` — invalid auth: HTTP 401/403, auth redirect или JSON-RPC auth error;
+- `1` — timeout, network/server, HTTP 5xx либо ошибка общего state.
+
+Режим с одноразовым служебным уведомлением:
+
+```bash
+sudo .venv/bin/python -m src.sbis.cookie_manager --check --alert
+```
+
+Alert отправляется только на `SBIS_AUTH_ALERT_EMAILS`. Значение
+`DAILY_REPORT_EMAILS` не используется как fallback. Timeout и HTTP 5xx не
+считаются истёкшей cookie и не вызывают auth-alert.
+
+#### State machine без повторных писем
+
+Hourly-check и preflight `src.daily_run` используют один state-файл:
+
+```text
+/var/lib/projectsbis/sbis_auth_state.json
+```
+
+Логика одного эпизода:
+
+```text
+HEALTHY + invalid → ALERTED + одна alert-попытка
+ALERTED + invalid → ALERTED, повторное письмо подавлено
+ALERTED + valid   → HEALTHY
+network / 5xx     → статус HEALTHY/ALERTED не меняется
+```
+
+Переход `HEALTHY → ALERTED` фиксируется до SMTP-вызова. Поэтому даже ошибка
+отправки alert не разрешает повторные письма каждый час. Новый alert станет
+возможен только после хотя бы одной успешной проверки `valid`.
+
+State содержит только:
+
+```json
+{
+  "status": "healthy|alerted",
+  "last_check_at": "...",
+  "last_invalid_at": "...",
+  "last_valid_at": "...",
+  "last_http_status": 401
+}
+```
+
+Cookie и HTTP-заголовки в state не сохраняются. JSON публикуется атомарно,
+read-modify-write защищён OS-level advisory lock. Отсутствующий или повреждённый
+state безопасно восстанавливается; первая invalid-проверка после этого снова
+может отправить alert.
+
+`src.daily_run` проверяет cookie до `initialize_database()`, создания
+`mail_runs`, загрузки selection и SMTP-рассылки. Если hourly-check уже перевёл
+state в `ALERTED`, daily run остановится с auth failure, но письмо не продублирует.
+
+#### Безопасная замена cookie
+
+```bash
+cd /opt/projectsbis/repository
+sudo .venv/bin/python -m src.sbis.cookie_manager
+```
+
+Новая cookie вводится через `getpass` и сначала проверяется. При invalid env не
+изменяется. При valid менеджер атомарно заменяет только
+`SBIS_BROWSER_COOKIE`, сохраняет остальные строки, права и владельца env,
+создаёт backup и переводит auth-state в `HEALTHY`.
+
+#### Установка hourly timer
+
+Unit-файлы:
+
+```text
+deploy/projectsbis-sbis-auth-check.service
+deploy/projectsbis-sbis-auth-check.timer
+```
+
+Установка и проверка синтаксиса:
+
+```bash
+cd /opt/projectsbis/repository
+sudo cp deploy/projectsbis-sbis-auth-check.service /etc/systemd/system/
+sudo cp deploy/projectsbis-sbis-auth-check.timer /etc/systemd/system/
+
+sudo systemd-analyze verify \
+    /etc/systemd/system/projectsbis-sbis-auth-check.service \
+    /etc/systemd/system/projectsbis-sbis-auth-check.timer
+
+sudo systemctl daemon-reload
+```
+
+Включение:
+
+```bash
+sudo systemctl enable --now projectsbis-sbis-auth-check.timer
+```
+
+Проверка расписания, состояния и логов:
+
+```bash
+systemctl list-timers projectsbis-sbis-auth-check.timer
+systemctl is-enabled projectsbis-sbis-auth-check.timer
+systemctl is-active projectsbis-sbis-auth-check.timer
+systemctl status projectsbis-sbis-auth-check.timer --no-pager
+systemctl status projectsbis-sbis-auth-check.service --no-pager
+sudo journalctl -u projectsbis-sbis-auth-check.service -n 100 --no-pager
+```
+
+Ручной запуск service использует `--check --alert` и при новом invalid-эпизоде
+может отправить служебное письмо:
+
+```bash
+sudo systemctl start projectsbis-sbis-auth-check.service
+```
+
+Отключение:
+
+```bash
+sudo systemctl disable --now projectsbis-sbis-auth-check.timer
+```
+
+`OnCalendar=hourly` запускает проверку каждый час. `Persistent=true` выполняет
+одну пропущенную проверку после следующего запуска системы. Наличие unit-файлов
+в Git не подтверждает, что timer установлен или включён на production VPS.
+
 ## 16. Типовые сценарии
 
 ### 16.1. Получить и обогатить выборку 5984
@@ -1276,13 +1431,19 @@ cd /opt/projectsbis/repository
 | Daily orchestration | ✅ | Единая команда `python -m src.daily_run` |
 | Daily итоговый отчёт | ✅ | Отправляется в конце полного production workflow |
 | Scheduler/systemd timer daily | ⚠️ | Unit-файлы есть в `deploy/`; установка и включение на VPS пока не подтверждены |
+| SBIS auth preflight | ✅ | Выполняется до БД, selection, `mail_runs` и рассылки |
+| Hourly SBIS auth timer | ⚠️ | Код и unit-файлы готовы; установка и включение на VPS требуют подтверждения |
+| Auth-alert dedup | ✅ | Общий атомарный state hourly/daily разрешает одну alert-попытку на invalid-эпизод |
 | Delivered/bounced ingestion | ✅ | `src.daily_run` синхронизирует статусы по журналу Postfix |
 | Unsubscribe | ❌ | Endpoint и suppression-механизм отсутствуют |
 
 Текущий daily-оркестратор последовательно выполняет:
 
 ```text
-initialize_database
+SBIS browser cookie preflight
+→ valid: state HEALTHY, продолжение
+→ invalid: state ALERTED, не более одного auth-alert, остановка
+→ initialize_database
 → создание mail_run
 → синхронизация selection 5984
 → обогащение
