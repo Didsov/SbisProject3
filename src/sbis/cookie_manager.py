@@ -4,6 +4,9 @@ CLI для проверки и безопасной замены SBIS_BROWSER_CO
 Проверка:
     python -m src.sbis.cookie_manager --check
 
+Почасовая проверка с одноразовым alert:
+    python -m src.sbis.cookie_manager --check --alert
+
 Интерактивная замена на VPS:
     sudo .venv/bin/python -m src.sbis.cookie_manager
 
@@ -31,6 +34,8 @@ from src.sbis.auth import (
     SbisAuthCheckResult,
     check_sbis_browser_cookie,
 )
+from src.sbis.auth_monitor import process_sbis_auth_result
+from src.sbis.auth_state import mark_sbis_auth_healthy
 
 
 COOKIE_KEY = "SBIS_BROWSER_COOKIE"
@@ -189,8 +194,9 @@ async def validate_and_replace_cookie(
     cookie: str,
     *,
     target_path: Path | None = None,
+    state_path: Path | None = None,
 ) -> CookieUpdateResult:
-    """Проверить новую cookie и записать её только при статусе valid."""
+    """Проверить cookie, записать её и сбросить общий state в HEALTHY."""
     path = (
         target_path.absolute()
         if target_path is not None
@@ -207,6 +213,10 @@ async def validate_and_replace_cookie(
     backup_path = replace_sbis_browser_cookie(
         path,
         clean_cookie,
+    )
+    mark_sbis_auth_healthy(
+        auth_result,
+        state_path=state_path,
     )
     return CookieUpdateResult(
         auth=auth_result,
@@ -240,14 +250,45 @@ def _exit_code(result: SbisAuthCheckResult) -> int:
     return 1
 
 
-async def run_check() -> int:
-    """Проверить текущую cookie и вернуть документированный exit code."""
+async def run_check(
+    *,
+    alert: bool = False,
+    state_path: Path | None = None,
+) -> int:
+    """Проверить cookie, обновить общий state и вернуть exit code."""
     result = await check_sbis_browser_cookie()
     print(_format_check_result(result))
+    monitor = await process_sbis_auth_result(
+        result,
+        alert_on_invalid=alert,
+        state_path=state_path,
+    )
+
+    if monitor.state_error_type:
+        print(
+            "Не удалось обновить SBIS auth-state: "
+            f"{monitor.state_error_type}. Auth-alert не отправлен."
+        )
+    elif monitor.alert_suppressed:
+        print(
+            "Auth-alert уже отправлялся в текущем эпизоде; "
+            "повторное письмо подавлено."
+        )
+    elif monitor.alert_error_type:
+        print(
+            "Не удалось отправить auth-alert: "
+            f"{monitor.alert_error_type}. "
+            "Исходный auth failure сохранён."
+        )
+    if monitor.state_error_type and not result.is_invalid_auth:
+        return 1
     return _exit_code(result)
 
 
-async def run_interactive_update() -> int:
+async def run_interactive_update(
+    *,
+    state_path: Path | None = None,
+) -> int:
     """Безопасно запросить, проверить и записать новую cookie."""
     target_path = get_cookie_env_path().absolute()
     print(f"Целевой env-файл: {target_path}")
@@ -262,6 +303,7 @@ async def run_interactive_update() -> int:
     result = await validate_and_replace_cookie(
         cookie,
         target_path=target_path,
+        state_path=state_path,
     )
     print(_format_check_result(result.auth))
 
@@ -272,6 +314,7 @@ async def run_interactive_update() -> int:
     print(f"SBIS_BROWSER_COOKIE обновлена в: {result.target_path}")
     if result.backup_path is not None:
         print(f"Backup: {result.backup_path}")
+    print("SBIS auth-state: HEALTHY")
     return 0
 
 
@@ -285,14 +328,25 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="Только проверить текущую cookie, не изменяя env.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--alert",
+        action="store_true",
+        help=(
+            "При первом invalid-эпизоде отправить одноразовый auth-alert. "
+            "Допустимо только вместе с --check."
+        ),
+    )
+    arguments = parser.parse_args()
+    if arguments.alert and not arguments.check:
+        parser.error("--alert можно использовать только вместе с --check")
+    return arguments
 
 
 def main() -> None:
     """CLI-точка входа cookie manager."""
     arguments = parse_arguments()
     exit_code = asyncio.run(
-        run_check()
+        run_check(alert=arguments.alert)
         if arguments.check
         else run_interactive_update()
     )

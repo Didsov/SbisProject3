@@ -1,0 +1,10 @@
+[Unit]
+Description=ProjectSbis SBIS Browser Cookie Check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/projectsbis/repository
+EnvironmentFile=/etc/projectsbis/projectsbis.env
+ExecStart=/opt/projectsbis/repository/.venv/bin/python -m src.sbis.cookie_manager --check --alert

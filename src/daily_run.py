@@ -70,7 +70,7 @@ from src.sbis.auth import (
     SbisAuthCheckResult,
     check_sbis_browser_cookie,
 )
-from src.sbis.auth_alert import send_sbis_auth_alert
+from src.sbis.auth_monitor import process_sbis_auth_result
 
 
 DEFAULT_SELECTION_ID = 5984
@@ -97,7 +97,9 @@ class SbisAuthPreflightError(RuntimeError):
         result: SbisAuthCheckResult,
     ) -> None:
         self.result = result
-        if result.is_invalid_auth:
+        if result.is_valid:
+            message = "Не удалось обновить общий SBIS auth-state"
+        elif result.is_invalid_auth:
             message = "Авторизация СБИС недействительна"
         else:
             message = "Не удалось проверить авторизацию СБИС"
@@ -441,7 +443,10 @@ async def run_daily(
         )
 
 
-async def run_sbis_auth_preflight() -> SbisAuthCheckResult:
+async def run_sbis_auth_preflight(
+    *,
+    state_path: Path | None = None,
+) -> SbisAuthCheckResult:
     """
     Подтвердить авторизацию до загрузки selection, БД и рассылки.
 
@@ -451,6 +456,20 @@ async def run_sbis_auth_preflight() -> SbisAuthCheckResult:
     """
     print("Проверка SBIS_BROWSER_COOKIE...")
     result = await check_sbis_browser_cookie()
+    monitor = await process_sbis_auth_result(
+        result,
+        alert_on_invalid=True,
+        state_path=state_path,
+    )
+
+    if monitor.state_error_type:
+        print(
+            "Не удалось обновить общий SBIS auth-state: "
+            f"{monitor.state_error_type}. Auth-alert не отправлен, "
+            "чтобы не допустить дубли."
+        )
+        if result.is_valid:
+            raise SbisAuthPreflightError(result)
 
     if result.is_valid:
         print("SBIS_BROWSER_COOKIE: OK")
@@ -471,13 +490,16 @@ async def run_sbis_auth_preflight() -> SbisAuthCheckResult:
             "Рассылка не выполнялась."
         )
 
-        try:
-            await send_sbis_auth_alert(result)
-        except Exception as alert_error:
+        if monitor.alert_suppressed:
+            print(
+                "Auth-alert уже отправлялся в текущем эпизоде; "
+                "повторное письмо подавлено."
+            )
+        elif monitor.alert_error_type:
             print(
                 "Не удалось отправить auth-alert; "
                 "исходная ошибка авторизации сохранена: "
-                f"{type(alert_error).__name__}"
+                f"{monitor.alert_error_type}"
             )
 
         raise SbisAuthPreflightError(result)

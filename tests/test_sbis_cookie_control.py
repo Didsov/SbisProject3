@@ -18,6 +18,8 @@ from src import daily_run
 from src.mailing.smtp_provider import SMTPSendResult
 from src.sbis import auth
 from src.sbis import auth_alert
+from src.sbis import auth_monitor
+from src.sbis import auth_state
 from src.sbis import cookie_manager
 
 
@@ -238,6 +240,9 @@ class CookieManagerTestCase(unittest.IsolatedAsyncioTestCase):
                 result = await cookie_manager.validate_and_replace_cookie(
                     "new-secret-cookie",
                     target_path=env_path,
+                    state_path=(
+                        Path(temporary_directory) / "auth-state.json"
+                    ),
                 )
 
             self.assertTrue(result.updated)
@@ -324,24 +329,29 @@ class CookieManagerTestCase(unittest.IsolatedAsyncioTestCase):
 
         for status, http_status, expected_code, expected_output in cases:
             with self.subTest(status=status):
-                output = io.StringIO()
-                with (
-                    patch.object(
-                        cookie_manager,
-                        "check_sbis_browser_cookie",
-                        new=AsyncMock(
-                            return_value=make_auth_result(
-                                status,
-                                http_status=http_status,
-                            )
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    output = io.StringIO()
+                    with (
+                        patch.object(
+                            cookie_manager,
+                            "check_sbis_browser_cookie",
+                            new=AsyncMock(
+                                return_value=make_auth_result(
+                                    status,
+                                    http_status=http_status,
+                                )
+                            ),
                         ),
-                    ),
-                    contextlib.redirect_stdout(output),
-                ):
-                    exit_code = await cookie_manager.run_check()
+                        contextlib.redirect_stdout(output),
+                    ):
+                        exit_code = await cookie_manager.run_check(
+                            state_path=(
+                                Path(temporary_directory) / "auth-state.json"
+                            ),
+                        )
 
-                self.assertEqual(exit_code, expected_code)
-                self.assertIn(expected_output, output.getvalue())
+                    self.assertEqual(exit_code, expected_code)
+                    self.assertIn(expected_output, output.getvalue())
 
 
 class DailyRunAuthPreflightTestCase(unittest.IsolatedAsyncioTestCase):
@@ -350,8 +360,12 @@ class DailyRunAuthPreflightTestCase(unittest.IsolatedAsyncioTestCase):
             "invalid_auth",
             http_status=401,
         )
-        alert = AsyncMock(
-            side_effect=RuntimeError("simulated alert failure"),
+        monitor = AsyncMock(
+            return_value=auth_monitor.SbisAuthMonitorOutcome(
+                state=auth_state.SbisAuthState(status="alerted"),
+                alert_required=True,
+                alert_error_type="RuntimeError",
+            )
         )
         create_run = Mock()
         load_selection = AsyncMock()
@@ -372,8 +386,8 @@ class DailyRunAuthPreflightTestCase(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(
                 daily_run,
-                "send_sbis_auth_alert",
-                new=alert,
+                "process_sbis_auth_result",
+                new=monitor,
             ),
             patch.object(daily_run, "create_mail_run", create_run),
             patch.object(daily_run, "load_daily_selection", load_selection),
@@ -394,7 +408,11 @@ class DailyRunAuthPreflightTestCase(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertIs(captured.exception.result, invalid_result)
-        alert.assert_awaited_once_with(invalid_result)
+        monitor.assert_awaited_once_with(
+            invalid_result,
+            alert_on_invalid=True,
+            state_path=None,
+        )
         create_run.assert_not_called()
         load_selection.assert_not_awaited()
         sender.assert_not_awaited()
@@ -410,7 +428,11 @@ class DailyRunAuthPreflightTestCase(unittest.IsolatedAsyncioTestCase):
             "network_server_error",
             http_status=503,
         )
-        alert = AsyncMock()
+        monitor = AsyncMock(
+            return_value=auth_monitor.SbisAuthMonitorOutcome(
+                state=auth_state.SbisAuthState(status="healthy"),
+            )
+        )
         locked_workflow = AsyncMock()
 
         with (
@@ -426,8 +448,8 @@ class DailyRunAuthPreflightTestCase(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(
                 daily_run,
-                "send_sbis_auth_alert",
-                new=alert,
+                "process_sbis_auth_result",
+                new=monitor,
             ),
             patch.object(daily_run, "_run_daily_locked", locked_workflow),
             contextlib.redirect_stdout(io.StringIO()),
@@ -442,7 +464,11 @@ class DailyRunAuthPreflightTestCase(unittest.IsolatedAsyncioTestCase):
                     mail_log=Path("mail.log"),
                 )
 
-        alert.assert_not_awaited()
+        monitor.assert_awaited_once_with(
+            error_result,
+            alert_on_invalid=True,
+            state_path=None,
+        )
         locked_workflow.assert_not_awaited()
 
 
@@ -505,7 +531,7 @@ class AuthAlertTestCase(unittest.IsolatedAsyncioTestCase):
             ),
             contextlib.redirect_stdout(output),
         ):
-            await auth_alert.send_sbis_auth_alert(
+            sent = await auth_alert.send_sbis_auth_alert(
                 make_auth_result(
                     "invalid_auth",
                     http_status=401,
@@ -513,6 +539,7 @@ class AuthAlertTestCase(unittest.IsolatedAsyncioTestCase):
             )
 
         provider_factory.assert_not_called()
+        self.assertFalse(sent)
         self.assertIn("не настроен", output.getvalue())
 
 

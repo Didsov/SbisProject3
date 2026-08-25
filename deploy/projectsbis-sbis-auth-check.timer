@@ -1,0 +1,10 @@
+[Unit]
+Description=Check ProjectSbis SBIS browser cookie hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=projectsbis-sbis-auth-check.service
+
+[Install]
+WantedBy=timers.target

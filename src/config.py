@@ -165,6 +165,24 @@ SBIS_AUTH_ALERT_EMAILS = optional_env(
     "SBIS_AUTH_ALERT_EMAILS"
 )
 
+DEFAULT_SBIS_AUTH_STATE_FILE = (
+    PROJECT_ROOT / "data" / "sbis_auth_state.json"
+    if os.name == "nt"
+    else Path("/var/lib/projectsbis/sbis_auth_state.json")
+)
+
+_configured_sbis_auth_state_file = Path(
+    optional_env(
+        "SBIS_AUTH_STATE_PATH",
+        str(DEFAULT_SBIS_AUTH_STATE_FILE),
+    )
+)
+SBIS_AUTH_STATE_FILE = (
+    _configured_sbis_auth_state_file
+    if _configured_sbis_auth_state_file.is_absolute()
+    else PROJECT_ROOT / _configured_sbis_auth_state_file
+)
+
 SBIS_SELECTION_ID = int(
     optional_env(
         "SBIS_SELECTION_ID",

@@ -14,8 +14,8 @@ AUTH_ALERT_SUBJECT = (
     "ProjectSbis: требуется обновить авторизацию СБИС"
 )
 COOKIE_RECOVERY_COMMAND = (
-    "sudo /opt/projectsbis/repository/.venv/bin/python "
-    "-m src.sbis.cookie_manager"
+    "cd /opt/projectsbis/repository\n"
+    "sudo .venv/bin/python -m src.sbis.cookie_manager"
 )
 
 
@@ -66,8 +66,8 @@ def build_sbis_auth_alert_bodies(
             "",
             f"Время проверки: {checked_at}",
             f"HTTP status: {http_status}",
-            "Daily run остановлен.",
-            "Рассылка не выполнялась.",
+            "Автоматический daily run остановлен.",
+            "Рассылка не выполнялась и не должна выполняться до восстановления.",
             "",
             "Команда восстановления:",
             COOKIE_RECOVERY_COMMAND,
@@ -84,8 +84,8 @@ def build_sbis_auth_alert_bodies(
             <strong>HTTP status:</strong> {escape(http_status)}
         </p>
         <p>
-            Daily run остановлен.<br>
-            Рассылка не выполнялась.
+            Автоматический daily run остановлен.<br>
+            Рассылка не выполнялась и не должна выполняться до восстановления.
         </p>
         <p><strong>Команда восстановления:</strong></p>
         <pre style="padding:12px;background:#f3f4f6;white-space:pre-wrap;">{escape(COOKIE_RECOVERY_COMMAND)}</pre>
@@ -97,7 +97,7 @@ def build_sbis_auth_alert_bodies(
 
 async def send_sbis_auth_alert(
     result: SbisAuthCheckResult,
-) -> None:
+) -> bool:
     """
     Отправить auth-alert только специальным получателям.
 
@@ -111,7 +111,7 @@ async def send_sbis_auth_alert(
             "SBIS_AUTH_ALERT_EMAILS не настроен: "
             "служебное auth-уведомление не отправлено."
         )
-        return
+        return False
 
     text_body, html_body = build_sbis_auth_alert_bodies(
         result,
@@ -140,3 +140,4 @@ async def send_sbis_auth_alert(
             "Не удалось отправить auth-alert: "
             f"ошибок {len(failures)}"
         )
+    return True
