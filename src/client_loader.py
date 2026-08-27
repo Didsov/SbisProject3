@@ -48,6 +48,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 from pathlib import Path
+
+import aiohttp
+
 from src.database import (
     get_unenriched_clients,
     initialize_database,
@@ -68,6 +71,29 @@ from src.database import (
 
 
 CONTRACTOR_CARD_DELAY_SECONDS = 3
+NETWORK_RETRY_DELAYS_SECONDS = (60, 120)
+
+
+async def request_with_network_retries(operation, /, *args, **kwargs):
+    """Повторить одну сетевую операцию через 60 и 120 секунд."""
+    for attempt in range(len(NETWORK_RETRY_DELAYS_SECONDS) + 1):
+        try:
+            return await operation(*args, **kwargs)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            if attempt == len(NETWORK_RETRY_DELAYS_SECONDS):
+                raise
+
+            delay = NETWORK_RETRY_DELAYS_SECONDS[attempt]
+            print()
+            print(
+                "Соединение с интернетом потеряно. Повторная попытка через "
+                f"{delay} секунд..."
+            )
+            await asyncio.sleep(delay)
+
+    raise RuntimeError("Недостижимое состояние сетевой операции")
+
+
 def load_inns(
     *,
     inn: str | None,
@@ -198,8 +224,9 @@ async def load_clients_by_inn(
             f"Поиск ИНН {inn}"
         )
 
-        spp_uuid = await search_company_uuid_by_inn(
-            inn
+        spp_uuid = await request_with_network_retries(
+            search_company_uuid_by_inn,
+            inn,
         )
 
         if spp_uuid is None:
@@ -323,6 +350,14 @@ def parse_arguments() -> argparse.Namespace:
             "необогащённых клиентов выбранной выборки."
         ),
     )
+    parser.add_argument(
+        "--skip-collection",
+        action="store_true",
+        help=(
+            "Не загружать состав выборки из СБИС, а обогатить уже сохранённых "
+            "в БД клиентов указанной выборки. Используется только с --selection."
+        ),
+    )
 
     arguments = parser.parse_args()
 
@@ -352,6 +387,21 @@ def parse_arguments() -> argparse.Namespace:
             "Нужно указать ровно один источник: "
             "--selection, --inn или --inn-file"
         )
+
+    if arguments.skip_collection and arguments.selection is None:
+        parser.error(
+            "--skip-collection можно использовать только с --selection"
+        )
+
+    if (
+        arguments.skip_collection
+        and not arguments.enrich_all
+        and arguments.enrich_limit == 0
+    ):
+        parser.error(
+            "для --skip-collection укажите --enrich-all или --enrich-limit"
+        )
+
     return arguments
 
 
@@ -470,7 +520,8 @@ async def enrich_selection_clients(
             f"{display_name}"
         )
 
-        card = await get_contractor_card(
+        card = await request_with_network_retries(
+            get_contractor_card,
             spp_uuid=spp_uuid,
             contractor_id=contractor_id,
         )
@@ -522,6 +573,7 @@ async def run(
     inn_file: str | None,
     enrich_limit: int,
     enrich_all: bool,
+    skip_collection: bool = False,
 ) -> None:
     """
     Выполнить загрузку и при необходимости обогащение выборки.
@@ -597,18 +649,27 @@ async def run(
 
         return
 
-    print(
-        f"Получаю выборку СБИС #{selection_id}..."
-    )
     if selection_id is None:
         raise RuntimeError(
             "selection_id отсутствует "
             "для режима загрузки выборки"
         )
 
-    all_clients = await get_all_clients(
-        selection_id
-    )
+    if skip_collection:
+        print()
+        print("Сбор клиентов из СБИС пропущен (--skip-collection).")
+        print(
+            f"Обогащаю уже сохранённых клиентов выборки #{selection_id}."
+        )
+    else:
+        print(
+            f"Получаю выборку СБИС #{selection_id}..."
+        )
+
+        all_clients = await request_with_network_retries(
+            get_all_clients,
+            selection_id,
+        )
     # if all_clients:
     #     print()
     #     print("DEBUG: первая строка выборки:")
@@ -618,16 +679,16 @@ async def run(
     #     print("DEBUG: поля первой строки:")
     #     print(list(all_clients[0].keys()))
 
-    saved_count = upsert_clients(
-        all_clients,
-        selection_id,
-    )
+        saved_count = upsert_clients(
+            all_clients,
+            selection_id,
+        )
 
-    print()
-    print(
-        "Клиентов сохранено или обновлено в БД: "
-        f"{saved_count}"
-    )
+        print()
+        print(
+            "Клиентов сохранено или обновлено в БД: "
+            f"{saved_count}"
+        )
 
     unenriched_clients = get_unenriched_clients(
         selection_id=selection_id
@@ -684,7 +745,8 @@ async def enrich_inn_clients(
             f"ContractorCard.Read: ИНН {inn}"
         )
 
-        card = await get_contractor_card(
+        card = await request_with_network_retries(
+            get_contractor_card,
             spp_uuid=spp_uuid,
             contractor_id=None,
         )
@@ -713,6 +775,34 @@ async def enrich_inn_clients(
                 CONTRACTOR_CARD_DELAY_SECONDS
             )
 
+
+async def run_cli(arguments: argparse.Namespace) -> bool:
+    """Запустить CLI без traceback при временной сетевой недоступности.
+
+    Сетевые операции сами выполняют две повторные попытки. Здесь последняя
+    неудача преобразуется в понятное завершение CLI. Программные ошибки не
+    скрываются.
+    """
+    try:
+        await run(
+            selection_id=arguments.selection,
+            inn=arguments.inn,
+            inn_file=arguments.inn_file,
+            enrich_limit=arguments.enrich_limit,
+            enrich_all=arguments.enrich_all,
+            skip_collection=arguments.skip_collection,
+        )
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        print()
+        print(
+            "Соединение с интернетом не восстановилось после двух повторных "
+            "попыток. Работа завершена без потери уже сохранённых данных."
+        )
+        return False
+
+    return True
+
+
 def main() -> None:
     """
     Запустить CLI-сценарий загрузки клиентов из СБИС.
@@ -727,15 +817,7 @@ def main() -> None:
     """
     arguments = parse_arguments()
 
-    asyncio.run(
-        run(
-            selection_id=arguments.selection,
-            inn=arguments.inn,
-            inn_file=arguments.inn_file,
-            enrich_limit=arguments.enrich_limit,
-            enrich_all=arguments.enrich_all,
-        )
-    )
+    asyncio.run(run_cli(arguments))
 
 
 if __name__ == "__main__":
