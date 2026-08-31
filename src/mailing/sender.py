@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 from src.config import TEST_MAIL_EMAIL
 
-from src.mailing.smtp_provider import SMTPMailProvider
+from src.mailing.smtp_provider import MailAttachment, SMTPMailProvider
 
 from src.database import (
     complete_mail_message,
@@ -72,6 +72,8 @@ class MailMessage:
     subject: str
     text_body: str
     html_body: str
+    attachments: list[MailAttachment] | None = None
+    include_logo: bool = True
 
 
 @dataclass(slots=True)

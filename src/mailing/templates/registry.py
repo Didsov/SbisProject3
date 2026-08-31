@@ -13,11 +13,12 @@
 
 from __future__ import annotations
 
-from src.mailing.templates import new_companies
+from src.mailing.templates import etrn, new_companies
 
 
 MAIL_TEMPLATES = {
     "new_companies": new_companies,
+    "etrn": etrn,
 }
 
 

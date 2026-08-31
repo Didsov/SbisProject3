@@ -973,6 +973,10 @@ def initialize_mailing_tables(
 
             selection_id INTEGER NOT NULL,
 
+            campaign_family TEXT NOT NULL DEFAULT 'new_companies',
+            next_send_at TEXT,
+            batch_sent_count INTEGER NOT NULL DEFAULT 0,
+
             status TEXT NOT NULL DEFAULT 'draft',
 
             created_at TEXT NOT NULL
@@ -998,6 +1002,16 @@ def initialize_mailing_tables(
             """
         )
 
+    for column_name, definition in {
+        "campaign_family": "TEXT NOT NULL DEFAULT 'new_companies'",
+        "next_send_at": "TEXT",
+        "batch_sent_count": "INTEGER NOT NULL DEFAULT 0",
+    }.items():
+        if column_name not in campaign_columns:
+            connection.execute(
+                f"ALTER TABLE mail_campaigns ADD COLUMN {column_name} {definition}"
+            )
+
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS mail_recipients (
@@ -1008,6 +1022,12 @@ def initialize_mailing_tables(
             client_id INTEGER NOT NULL,
 
             email TEXT NOT NULL,
+
+            normalized_email TEXT,
+            campaign_family TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT,
+            last_error TEXT,
 
             status TEXT NOT NULL DEFAULT 'pending',
 
@@ -1031,6 +1051,40 @@ def initialize_mailing_tables(
                 email
             )
         )
+        """
+    )
+
+    recipient_columns = {
+        row["name"]
+        for row in connection.execute(
+            "PRAGMA table_info(mail_recipients)"
+        ).fetchall()
+    }
+    for column_name, definition in {
+        "normalized_email": "TEXT",
+        "campaign_family": "TEXT",
+        "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+        "next_attempt_at": "TEXT",
+        "last_error": "TEXT",
+    }.items():
+        if column_name not in recipient_columns:
+            connection.execute(
+                f"ALTER TABLE mail_recipients ADD COLUMN {column_name} {definition}"
+            )
+
+    connection.execute(
+        "UPDATE mail_recipients SET normalized_email = LOWER(TRIM(email)) "
+        "WHERE normalized_email IS NULL"
+    )
+    connection.execute(
+        """
+        UPDATE mail_recipients
+        SET campaign_family = COALESCE(
+            (SELECT campaign_family FROM mail_campaigns
+             WHERE id = mail_recipients.campaign_id),
+            'new_companies'
+        )
+        WHERE campaign_family IS NULL
         """
     )
 
@@ -1205,6 +1259,25 @@ def initialize_mailing_tables(
 
     connection.execute(
         """
+        CREATE TABLE IF NOT EXISTS mail_audience_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id INTEGER NOT NULL,
+            client_id INTEGER,
+            source_value TEXT,
+            email TEXT,
+            event_type TEXT NOT NULL,
+            event_data TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (campaign_id)
+                REFERENCES mail_campaigns(id) ON DELETE CASCADE,
+            FOREIGN KEY (client_id)
+                REFERENCES clients(id) ON DELETE SET NULL
+        )
+        """
+    )
+
+    connection.execute(
+        """
         CREATE INDEX IF NOT EXISTS
             idx_mail_runs_campaign_id
         ON mail_runs(campaign_id)
@@ -1256,6 +1329,21 @@ def initialize_mailing_tables(
         CREATE INDEX IF NOT EXISTS
             idx_mail_recipients_status
         ON mail_recipients(status)
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_recipients_etrn_email
+        ON mail_recipients(campaign_family, normalized_email)
+        WHERE campaign_family = 'etrn' AND normalized_email IS NOT NULL
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_mail_audience_events_campaign
+        ON mail_audience_events(campaign_id, event_type)
         """
     )
 
@@ -2082,7 +2170,10 @@ def get_mail_campaign(
                 name,
                 selection_id,
                 template_name,
-                status
+                status,
+                campaign_family,
+                next_send_at,
+                batch_sent_count
             FROM mail_campaigns
             WHERE id = ?
             """,
@@ -2109,9 +2200,9 @@ def create_mail_run(
             "campaign_id должен быть больше 0"
         )
 
-    if selection_id < 1:
+    if selection_id < 0:
         raise ValueError(
-            "selection_id должен быть больше 0"
+            "selection_id не может быть меньше 0"
         )
 
     if trigger != "manual":
@@ -3711,7 +3802,9 @@ def ensure_default_mail_campaign() -> int:
         connection.execute(
             """
             UPDATE mail_campaigns
-            SET template_name = ?
+            SET
+                template_name = ?,
+                campaign_family = 'new_companies'
             WHERE id = ?
               AND (
                     template_name IS NULL
