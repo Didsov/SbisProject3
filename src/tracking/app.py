@@ -22,6 +22,7 @@ from __future__ import annotations
 from aiohttp import web
 
 from src.config import (
+    CONTACT_ETRN_WHATSAPP_URL,
     CONTACT_MAX_URL,
     CONTACT_PHONE_URL,
     CONTACT_TELEGRAM_URL,
@@ -49,6 +50,7 @@ CLICK_TARGETS = {
     "cta_email": CONTACT_WHATSAPP_URL,
     "phone": CONTACT_PHONE_URL,
     "whatsapp": CONTACT_WHATSAPP_URL,
+    "etrn_whatsapp": CONTACT_ETRN_WHATSAPP_URL,
     "telegram": CONTACT_TELEGRAM_URL,
     "max": CONTACT_MAX_URL,
 }
@@ -72,7 +74,7 @@ def process_click_tracking(
 
         click_key:
             Стабильный идентификатор ссылки:
-            cta_email, phone, whatsapp, telegram или max.
+            cta_email, phone, whatsapp, etrn_whatsapp, telegram или max.
 
     Возвращает:
         Реальный URL назначения либо None,

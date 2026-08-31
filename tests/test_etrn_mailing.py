@@ -9,6 +9,7 @@ import warnings
 from contextlib import closing, redirect_stdout
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import parse_qs, urlsplit
 
 import src.database as database
 from src.mailing import etrn
@@ -661,8 +662,22 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(generic.startswith("Добрый день!"))
         self.assertIn("Добрый день, Валерий Дмитриевич!", personalized)
-        self.assertIn("/t/c/token-1/cta_email", personalized)
+        self.assertIn("/t/c/token-1/etrn_whatsapp", personalized)
+        self.assertIn("/t/c/token-1/phone", personalized)
+        self.assertIn("/t/c/token-1/telegram", personalized)
+        self.assertIn("/t/c/token-1/max", personalized)
         self.assertIn("/t/o/token-1.gif", personalized)
+        self.assertIn("WhatsApp:", generic)
+        self.assertIn("Telegram:", generic)
+        self.assertIn("MAX:", generic)
+
+        whatsapp_text = parse_qs(
+            urlsplit(etrn_template.CONTACT_ETRN_WHATSAPP_URL).query
+        )["text"]
+        self.assertEqual(whatsapp_text, [
+            "Обращение по ЭТрН из письма\n"
+            "Здравствуйте! Меня заинтересовало ваше предложение по подключению ЭТрН."
+        ])
 
     def test_smtp_mime_preserves_utf8_pdf_filename(self) -> None:
         filename = etrn.ATTACHMENT_FILENAMES[0]

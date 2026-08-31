@@ -2162,6 +2162,7 @@ def get_mail_campaign_stats(
         event_data_to_metric = {
             '{"click_key":"phone"}': "click_phone",
             '{"click_key":"whatsapp"}': "click_whatsapp",
+            '{"click_key":"etrn_whatsapp"}': "click_whatsapp",
             '{"click_key":"telegram"}': "click_telegram",
             '{"click_key":"max"}': "click_max",
             '{"click_key":"cta_email"}': "click_cta_email",

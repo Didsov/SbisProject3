@@ -185,6 +185,34 @@ class TrackingContactsHttpTestCase(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(count, 0)
 
+    async def test_etrn_whatsapp_redirect_keeps_tracking_and_custom_text(
+        self,
+    ) -> None:
+        response = await self.client.get(
+            f"/t/c/{self.tracking_token}/etrn_whatsapp",
+            allow_redirects=False,
+        )
+
+        self.assertEqual(response.status, 302)
+        actual = urlsplit(response.headers["Location"])
+        expected = urlsplit(str(config.CONTACT_ETRN_WHATSAPP_URL))
+        self.assertEqual(
+            (actual.netloc, actual.path),
+            (expected.netloc, expected.path),
+        )
+        self.assertEqual(parse_qs(actual.query), parse_qs(expected.query))
+        self.assertEqual(
+            parse_qs(actual.query)["text"],
+            [config.ETRN_WHATSAPP_TEXT],
+        )
+
+        with closing(database.get_connection()) as connection:
+            event_data = connection.execute(
+                "SELECT event_data FROM mail_events WHERE message_id = ? ORDER BY id DESC",
+                (self.message_id,),
+            ).fetchone()["event_data"]
+        self.assertEqual(event_data, '{"click_key":"etrn_whatsapp"}')
+
     async def test_unknown_old_token_does_not_return_500(self) -> None:
         response = await self.client.get(
             "/t/c/old-or-missing-token/cta_email",

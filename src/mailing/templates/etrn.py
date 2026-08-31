@@ -6,7 +6,14 @@ import html
 import re
 from textwrap import dedent
 
-from src.config import CONTACT_EMAIL, CONTACT_PHONE_DISPLAY, CONTACT_WHATSAPP_URL
+from src.config import (
+    CONTACT_EMAIL,
+    CONTACT_ETRN_WHATSAPP_URL,
+    CONTACT_MAX_URL,
+    CONTACT_PHONE_DISPLAY,
+    CONTACT_PHONE_URL,
+    CONTACT_TELEGRAM_URL,
+)
 from src.mailing.templates.new_companies import TRACKING_BASE_URL, build_click_url
 
 
@@ -40,8 +47,8 @@ def build_text_body(
     )
     cta = build_click_url(
         tracking_token=tracking_token,
-        click_key="cta_email",
-        direct_url=CONTACT_WHATSAPP_URL,
+        click_key="etrn_whatsapp",
+        direct_url=CONTACT_ETRN_WHATSAPP_URL,
     )
     return dedent(f"""
         {greeting}
@@ -69,8 +76,13 @@ def build_text_body(
         При подключении бесплатно поможем оформить ГосКлюч водителю.
         Получить консультацию по ЭТрН: {cta}
 
+        Связаться с нами:
+        Телефон: {CONTACT_PHONE_DISPLAY}
+        WhatsApp: {CONTACT_ETRN_WHATSAPP_URL}
+        Telegram: {CONTACT_TELEGRAM_URL}
+        MAX: {CONTACT_MAX_URL}
+
         Владивосток · Артём · Уссурийск · Находка
-        {CONTACT_PHONE_DISPLAY}
         {CONTACT_EMAIL}
     """).strip()
 
@@ -85,8 +97,28 @@ def build_html_body(
     ))
     cta = html.escape(build_click_url(
         tracking_token=tracking_token,
-        click_key="cta_email",
-        direct_url=CONTACT_WHATSAPP_URL,
+        click_key="etrn_whatsapp",
+        direct_url=CONTACT_ETRN_WHATSAPP_URL,
+    ), quote=True)
+    phone_url = html.escape(build_click_url(
+        tracking_token=tracking_token,
+        click_key="phone",
+        direct_url=CONTACT_PHONE_URL,
+    ), quote=True)
+    whatsapp_url = html.escape(build_click_url(
+        tracking_token=tracking_token,
+        click_key="etrn_whatsapp",
+        direct_url=CONTACT_ETRN_WHATSAPP_URL,
+    ), quote=True)
+    telegram_url = html.escape(build_click_url(
+        tracking_token=tracking_token,
+        click_key="telegram",
+        direct_url=CONTACT_TELEGRAM_URL,
+    ), quote=True)
+    max_url = html.escape(build_click_url(
+        tracking_token=tracking_token,
+        click_key="max",
+        direct_url=CONTACT_MAX_URL,
     ), quote=True)
     pixel = (
         f'<img src="{TRACKING_BASE_URL}/t/o/{html.escape(tracking_token)}.gif" '
@@ -132,7 +164,20 @@ def build_html_body(
         <div style="margin:24px 0;padding:18px;background:#f7f9fa;border-left:4px solid #13afc1"><b>Во вложении:</b><br>чек-лист подготовки бизнеса и коммерческое предложение по Saby TMS и ЭТрН.</div>
         <div style="margin:24px 0;padding:18px;background:#fff4ed;border-radius:10px"><b>Специальное предложение:</b> бесплатно поможем оформить ГосКлюч водителю.</div>
         <table role="presentation" cellspacing="0" cellpadding="0"><tr><td bgcolor="#e76a2e" style="border-radius:8px"><a href="{cta}" style="display:inline-block;padding:14px 22px;color:#fff;text-decoration:none;font-weight:bold">Получить консультацию по ЭТрН</a></td></tr></table>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;margin-top:24px;background-color:#f7f9fa;border-radius:10px">
+        <tr><td style="padding:20px 24px 22px 24px">
+        <div style="margin:0;font-size:15px;line-height:1.4;font-weight:700;color:#202124">Связаться с нами</div>
+        <table role="presentation" cellspacing="0" cellpadding="0" border="0" style="margin-top:12px"><tr>
+        <td valign="middle" style="width:28px;height:28px;text-align:center;vertical-align:middle;background-color:#e8f8fa;border-radius:7px;font-size:16px;line-height:28px;color:#13afc1">&#9742;</td>
+        <td valign="middle" style="padding-left:9px"><a href="{phone_url}" style="display:inline-block;color:#202124;text-decoration:none;font-size:16px;line-height:1.4;font-weight:700">{html.escape(str(CONTACT_PHONE_DISPLAY or ''))}</a></td>
+        </tr></table>
+        <div style="margin-top:13px;margin-bottom:9px;font-size:12px;line-height:1.45;color:#5f6368">Выберите удобный мессенджер</div>
+        <div style="font-size:0;line-height:0">
+        <table role="presentation" cellspacing="0" cellpadding="0" border="0" style="display:inline-table;margin:0 8px 8px 0;vertical-align:top"><tr><td style="height:40px;background-color:#fff;border:1px solid #e2e6e8;border-radius:8px"><a href="{whatsapp_url}" style="display:block;padding:10px 14px;color:#202124;text-decoration:none;font-size:14px;line-height:18px;font-weight:600;white-space:nowrap"><span style="display:inline-block;width:18px;height:18px;margin-right:7px;border-radius:50%;background-color:#e8f8fa;color:#13afc1;font-size:13px;line-height:18px;text-align:center;vertical-align:-1px">&#9742;</span>WhatsApp</a></td></tr></table>
+        <table role="presentation" cellspacing="0" cellpadding="0" border="0" style="display:inline-table;margin:0 8px 8px 0;vertical-align:top"><tr><td style="height:40px;background-color:#fff;border:1px solid #e2e6e8;border-radius:8px"><a href="{telegram_url}" style="display:block;padding:10px 14px;color:#202124;text-decoration:none;font-size:14px;line-height:18px;font-weight:600;white-space:nowrap"><span style="display:inline-block;width:18px;margin-right:7px;color:#13afc1;font-size:17px;line-height:18px;text-align:center;vertical-align:-1px">&#10148;</span>Telegram</a></td></tr></table>
+        <table role="presentation" cellspacing="0" cellpadding="0" border="0" style="display:inline-table;margin:0 0 8px 0;vertical-align:top"><tr><td style="height:40px;background-color:#fff;border:1px solid #e2e6e8;border-radius:8px"><a href="{max_url}" style="display:block;padding:10px 14px;color:#202124;text-decoration:none;font-size:14px;line-height:18px;font-weight:600;white-space:nowrap"><span style="display:inline-block;width:18px;height:18px;margin-right:7px;border-radius:50%;background-color:#e8f8fa;color:#13afc1;font-size:11px;line-height:18px;font-weight:700;text-align:center;vertical-align:-1px">M</span>MAX</a></td></tr></table>
+        </div></td></tr></table>
         <p style="margin-top:28px;line-height:1.55">Не откладывайте подключение: выпуск подписей и доверенностей, обучение и интеграция требуют времени.</p>
-        <p style="margin-top:28px;color:#5f6368">Владивосток · Артём · Уссурийск · Находка<br>{html.escape(str(CONTACT_PHONE_DISPLAY or ''))}<br>{html.escape(str(CONTACT_EMAIL or ''))}</p>
+        <p style="margin-top:28px;color:#5f6368">Владивосток · Артём · Уссурийск · Находка<br>{html.escape(str(CONTACT_EMAIL or ''))}</p>
         </td></tr></table></td></tr></table>{pixel}</body></html>
     """).strip()

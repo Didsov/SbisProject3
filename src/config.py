@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 
@@ -243,6 +243,25 @@ CONTACT_PHONE_URL = optional_env(
     "tel:+79520802220",
 )
 
+
+def build_whatsapp_message_url(base_url: str, text: str) -> str:
+    """Заменить только предзаполненный текст в существующей WhatsApp-ссылке."""
+    parts = urlsplit(base_url)
+    query = [
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if key != "text"
+    ]
+    query.append(("text", text))
+    return urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        parts.path,
+        urlencode(query),
+        parts.fragment,
+    ))
+
+
 CONTACT_WHATSAPP_URL = optional_env(
     "CONTACT_WHATSAPP_URL",
     (
@@ -257,6 +276,16 @@ CONTACT_WHATSAPP_URL = optional_env(
             }
         )
     ),
+)
+
+ETRN_WHATSAPP_TEXT = (
+    "Обращение по ЭТрН из письма\n"
+    "Здравствуйте! Меня заинтересовало ваше предложение по подключению ЭТрН."
+)
+
+CONTACT_ETRN_WHATSAPP_URL = build_whatsapp_message_url(
+    CONTACT_WHATSAPP_URL,
+    ETRN_WHATSAPP_TEXT,
 )
 
 CONTACT_TELEGRAM_URL = optional_env(
