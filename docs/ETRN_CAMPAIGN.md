@@ -148,6 +148,11 @@ until=2026-08-31T12:34:56+00:00
 останавливается до создания run/message и никогда не переключается на реальные
 email. В лог выводятся только факт включения и количество адресов.
 
+Временный `ETRN_TEST_DISABLE_ATTACHMENTS=true` убирает PDF только когда также
+включён `ETRN_TEST_RECIPIENTS_ENABLED=true`. Шаблон, тема, ссылки и текст письма
+не меняются. В обычном режиме PDF остаются обязательными, даже если этот флаг
+случайно оставлен включённым.
+
 Переменные окружения и значения по умолчанию:
 
 | Переменная | Значение |
@@ -155,6 +160,7 @@ email. В лог выводятся только факт включения и 
 | `ETRN_BATCH_LIMIT` | `500` |
 | `ETRN_TEST_RECIPIENTS_ENABLED` | `false` |
 | `ETRN_TEST_RECIPIENTS` | пусто |
+| `ETRN_TEST_DISABLE_ATTACHMENTS` | `false` |
 | `ETRN_MESSAGE_DELAY_MIN_SECONDS` | `6` |
 | `ETRN_MESSAGE_DELAY_MAX_SECONDS` | `8` |
 | `ETRN_COOLDOWN_MIN_SECONDS` | `2400` |

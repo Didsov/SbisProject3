@@ -113,6 +113,14 @@ def get_test_recipient_config() -> TestRecipientConfig:
     return TestRecipientConfig(enabled=True, recipients=recipients)
 
 
+def should_disable_test_attachments(test_config: TestRecipientConfig) -> bool:
+    """Отключить PDF только при одновременно включённом test-recipient режиме."""
+    return test_config.enabled and _env_bool(
+        "ETRN_TEST_DISABLE_ATTACHMENTS",
+        False,
+    )
+
+
 @dataclass(slots=True)
 class PrepareStats:
     input_inns: int = 0
@@ -558,14 +566,16 @@ async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
         raise ValueError("Для реальной отправки требуется --confirm-real-send")
     batch_size = get_batch_limit()
     test_config = get_test_recipient_config()
+    disable_attachments = should_disable_test_attachments(test_config)
     if test_config.enabled:
         print(
             "ETRN TEST RECIPIENT MODE ENABLED\n"
-            f"configured_test_recipients={len(test_config.recipients)}"
+            f"configured_test_recipients={len(test_config.recipients)}\n"
+            f"attachments_disabled={str(disable_attachments).lower()}"
         )
     initialize_database()
     campaign_id = ensure_etrn_campaign()
-    attachments = load_attachments()
+    attachments = [] if disable_attachments else load_attachments()
     template = get_mail_template(TEMPLATE_NAME)
     if dry_run:
         recipients = _eligible_recipients(
@@ -797,6 +807,10 @@ def print_configuration() -> None:
     mode = "ENABLED" if test_config.enabled else "DISABLED"
     print(f"ETRN test recipient mode: {mode}")
     print(f"Configured test recipients: {len(test_config.recipients)}")
+    print(
+        "Attachments disabled in test mode: "
+        f"{should_disable_test_attachments(test_config)}"
+    )
     print(f"Batch limit: {get_batch_limit()}")
 
 

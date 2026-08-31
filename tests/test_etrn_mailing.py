@@ -329,6 +329,13 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
         empty_dir.mkdir()
         with (
             patch.object(etrn, "ATTACHMENTS_DIR", empty_dir),
+            patch.dict(
+                "os.environ",
+                {
+                    "ETRN_TEST_RECIPIENTS_ENABLED": "false",
+                    "ETRN_TEST_DISABLE_ATTACHMENTS": "true",
+                },
+            ),
             self.assertRaises(FileNotFoundError),
         ):
             await etrn.send_campaign(dry_run=True, confirm_real_send=False)
@@ -341,6 +348,7 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
                     "ETRN_BATCH_LIMIT": "4",
                     "ETRN_TEST_RECIPIENTS_ENABLED": "true",
                     "ETRN_TEST_RECIPIENTS": "first@example.ru,second@example.ru",
+                    "ETRN_TEST_DISABLE_ATTACHMENTS": "false",
                 },
             ),
             redirect_stdout(output := io.StringIO()),
@@ -352,9 +360,25 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
             [
                 "ETRN test recipient mode: ENABLED",
                 "Configured test recipients: 2",
+                "Attachments disabled in test mode: False",
                 "Batch limit: 4",
             ],
         )
+
+    def test_attachment_flag_cannot_disable_production_attachments(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"ETRN_TEST_DISABLE_ATTACHMENTS": "true"},
+        ):
+            self.assertFalse(etrn.should_disable_test_attachments(
+                etrn.TestRecipientConfig(enabled=False, recipients=()),
+            ))
+            self.assertTrue(etrn.should_disable_test_attachments(
+                etrn.TestRecipientConfig(
+                    enabled=True,
+                    recipients=("test@example.ru",),
+                ),
+            ))
 
     async def test_enabled_test_mode_with_invalid_list_fails_before_database(self) -> None:
         with (
@@ -420,6 +444,7 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
                     "ETRN_TEST_RECIPIENTS": (
                         "test-a@example.ru,test-b@example.ru"
                     ),
+                    "ETRN_TEST_DISABLE_ATTACHMENTS": "true",
                     "ETRN_MESSAGE_DELAY_MIN_SECONDS": "0",
                     "ETRN_MESSAGE_DELAY_MAX_SECONDS": "0",
                 },
@@ -439,6 +464,22 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
             smtp_addresses,
             ["test-a@example.ru", "test-b@example.ru", "test-a@example.ru"],
         )
+        outbound_messages = [
+            call.args[0]
+            for call in provider.send.await_args_list
+        ]
+        self.assertTrue(all(
+            not message.attachments
+            for message in outbound_messages
+        ))
+        self.assertTrue(all(
+            message.subject == etrn_template.SUBJECT
+            for message in outbound_messages
+        ))
+        self.assertTrue(all(
+            "/etrn_whatsapp" in message.html_body
+            for message in outbound_messages
+        ))
         with closing(database.get_connection()) as connection:
             recipients = connection.execute(
                 """
