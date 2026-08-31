@@ -12,6 +12,7 @@ RUN = {
     "run_id": 7,
     "campaign_id": 3,
     "campaign_name": "Campaign <unsafe>",
+    "campaign_family": "new_companies",
     "selection_id": 5984,
     "trigger": "manual",
     "status": "partial",
@@ -23,6 +24,20 @@ RUN = {
     "bounced_count": 1,
     "deferred_count": 0,
     "failed_count": 0,
+    "input_inns_count": 0,
+    "clients_found_count": 0,
+    "clients_without_email_count": 0,
+    "email_found_after_enrichment_count": 0,
+    "invalid_email_count": 0,
+    "duplicate_count": 0,
+    "bounced_before_send_count": 0,
+    "prepared_email_count": 2,
+    "skipped_count": 0,
+    "pending_count": 0,
+    "open_count": 2,
+    "unique_open_count": 1,
+    "click_count": 1,
+    "unique_click_count": 1,
 }
 
 EMPTY_RUN = {
@@ -48,10 +63,12 @@ MESSAGES = [
     {
         "message_id": 21,
         "company_name": "Company <One>",
+        "inn": "9900000001",
         "email": "one@example.invalid",
         "send_status": "sent",
         "delivery_status": "delivered",
         "sent_at": "2026-08-20 09:01:00",
+        "delivered_at": "2026-08-20 09:02:00",
         "opened_count": 2,
         "clicked_count": 1,
         "last_event_at": "2026-08-20 09:05:00",
@@ -63,14 +80,19 @@ MESSAGE_DETAILS = {
     "run_id": 7,
     "campaign_id": 3,
     "campaign_name": "Campaign <unsafe>",
+    "campaign_family": "new_companies",
+    "run_status": "partial",
+    "run_started_at": "2026-08-20 09:00:00",
     "client_id": 11,
     "company_name": "Company <One>",
+    "inn": "9900000001",
     "email": "one@example.invalid",
     "provider": "smtp",
     "provider_message_id": "provider-<unsafe>",
     "send_status": "sent",
     "delivery_status": "delivered",
     "sent_at": "2026-08-20 09:01:00",
+    "delivered_at": "2026-08-20 09:02:00",
     "tracking_token": "token-<unsafe>",
     "opened_count": 2,
     "clicked_count": 1,
@@ -218,14 +240,16 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("#8 — новых получателей нет", dashboard_html)
         self.assertIn("○ Нет новых получателей", dashboard_html)
         for label in (
-            "Получателей",
+            "Подготовлено",
+            "Pending",
             "Отправлено",
             "Принято сервером",
             "Bounce",
-            "Открыли",
-            "Кликнули",
+            "Открытия / уник.",
+            "Клики / уник.",
             "Длительность",
             "Кампания",
+            "Семейство",
             "Selection",
         ):
             self.assertIn(label, dashboard_html)
@@ -249,11 +273,15 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
             "Запуск",
             "Кампания",
             "Начало",
-            "Длительность",
-            "Получатели",
+            "ИНН",
+            "Подготовлено",
+            "Skipped",
+            "Pending",
             "Отправлено",
             "Принято сервером",
             "Ошибки",
+            "Открытия / уник.",
+            "Клики / уник.",
             "Статус",
         ):
             self.assertIn(label, runs_html)
@@ -284,12 +312,12 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.assertIn("Запуск #7", page_html)
         self.assertIn("Company &lt;One&gt;", page_html)
-        self.assertIn("Отправка", page_html)
-        self.assertIn("Доставка", page_html)
+        self.assertIn("Статус message", page_html)
+        self.assertIn("Delivery status", page_html)
         self.assertIn("Открытия", page_html)
         self.assertIn("Клики", page_html)
         self.assertIn("✓ Принято", page_html)
-        self.assertIn("Ошибки SMTP", page_html)
+        self.assertIn("Failed", page_html)
         self.assertIn("Последние события", page_html)
         self.assertIn("Клик", page_html)
         self.assertIn(
@@ -306,6 +334,43 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
         self.get_details.assert_called_once_with(7)
         self.get_messages.assert_called_once_with(7)
         self.get_events.assert_called_once_with(7)
+
+    async def test_etrn_run_shows_preparation_breakdown(self) -> None:
+        self.get_details.return_value = {
+            **DETAILS,
+            "campaign_name": "etrn_2026_08",
+            "campaign_family": "etrn",
+            "input_inns_count": 12,
+            "clients_found_count": 10,
+            "clients_without_email_count": 2,
+            "email_found_after_enrichment_count": 3,
+            "invalid_email_count": 1,
+            "duplicate_count": 2,
+            "bounced_before_send_count": 1,
+            "prepared_email_count": 7,
+            "skipped_count": 5,
+            "pending_count": 4,
+        }
+
+        response = await self.client.get("/admin/runs/7")
+        page_html = await response.text()
+
+        self.assertEqual(response.status, 200)
+        for label in (
+            "ИНН во входном списке",
+            "Клиентов найдено",
+            "Клиентов без email",
+            "Email после enrichment",
+            "Invalid email",
+            "Duplicate ETRN",
+            "Bounced до отправки",
+            "К отправке",
+        ):
+            self.assertIn(label, page_html)
+        self.assertIn("etrn_2026_08", page_html)
+        self.assertIn("Email подготовлено", page_html)
+        self.assertIn("Уник. открытия", page_html)
+        self.assertIn("Уник. клики", page_html)
 
     async def test_message_details_contains_timeline_and_channel(
         self,

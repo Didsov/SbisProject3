@@ -81,8 +81,33 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
                     (campaign_id,),
                 ).fetchall()
             }
+            prepare_run = connection.execute(
+                """
+                SELECT input_inns_count, clients_found_count,
+                       clients_without_email_count, invalid_email_count,
+                       duplicate_count, prepared_email_count,
+                       skipped_count, pending_count
+                FROM mail_runs
+                WHERE campaign_id = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (campaign_id,),
+            ).fetchone()
         self.assertEqual([row["normalized_email"] for row in rows], ["a@example.ru", "b@example.ru"])
         self.assertTrue({"client_not_found", "no_email", "invalid_email", "duplicate_etrn"} <= reasons)
+        self.assertEqual(
+            dict(prepare_run),
+            {
+                "input_inns_count": 4,
+                "clients_found_count": 3,
+                "clients_without_email_count": 1,
+                "invalid_email_count": 1,
+                "duplicate_count": 1,
+                "prepared_email_count": 2,
+                "skipped_count": 4,
+                "pending_count": 2,
+            },
+        )
 
     def test_family_dedup_spans_separate_etrn_campaigns(self) -> None:
         first_client = self.add_client("2500000030", ["same@example.ru"])
@@ -114,9 +139,26 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
                     "PRAGMA table_info(mail_recipients)"
                 ).fetchall()
             }
+            run_columns = {
+                row["name"] for row in connection.execute(
+                    "PRAGMA table_info(mail_runs)"
+                ).fetchall()
+            }
             quick_check = connection.execute("PRAGMA quick_check").fetchone()[0]
         self.assertTrue({"campaign_family", "next_send_at", "batch_sent_count"} <= campaign_columns)
         self.assertTrue({"normalized_email", "attempt_count", "next_attempt_at"} <= recipient_columns)
+        self.assertTrue({
+            "input_inns_count",
+            "clients_found_count",
+            "clients_without_email_count",
+            "email_found_after_enrichment_count",
+            "invalid_email_count",
+            "duplicate_count",
+            "bounced_before_send_count",
+            "prepared_email_count",
+            "skipped_count",
+            "pending_count",
+        } <= run_columns)
         self.assertEqual(quick_check, "ok")
 
     async def test_dry_run_does_not_change_queue_or_create_messages(self) -> None:

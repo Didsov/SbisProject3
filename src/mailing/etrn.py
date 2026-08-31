@@ -16,6 +16,7 @@ from src.client_loader import request_with_network_retries
 from src.config import PROJECT_ROOT
 from src.database import (
     complete_mail_message,
+    copy_latest_mail_run_preparation_stats,
     create_mail_message,
     create_mail_run,
     finish_mail_run,
@@ -23,6 +24,8 @@ from src.database import (
     get_mail_campaign,
     initialize_database,
     save_enriched_client,
+    set_mail_run_preparation_stats,
+    set_mail_run_pending_count,
 )
 from src.mailing.sender import MailMessage, build_mail_message
 from src.mailing.smtp_provider import MailAttachment, SMTPMailProvider
@@ -63,6 +66,8 @@ class PrepareStats:
     without_email: int = 0
     unique_emails: int = 0
     duplicate_etrn: int = 0
+    invalid_email: int = 0
+    bounced_before_send: int = 0
     invalid_or_bounced: int = 0
     queued: int = 0
 
@@ -232,10 +237,12 @@ async def prepare_audience(inn_file: Path) -> tuple[int, PrepareStats]:
         for raw_email in emails:
             email = normalize_email(raw_email)
             if not is_valid_email(email):
+                stats.invalid_email += 1
                 stats.invalid_or_bounced += 1
                 _audit(campaign_id, "invalid_email", source_value=inn, client_id=client_id, email=email)
                 continue
             if _was_bounced(email):
+                stats.bounced_before_send += 1
                 stats.invalid_or_bounced += 1
                 _audit(campaign_id, "bounced", source_value=inn, client_id=client_id, email=email)
                 continue
@@ -248,6 +255,27 @@ async def prepare_audience(inn_file: Path) -> tuple[int, PrepareStats]:
             stats.queued += 1
 
     prepare_run_id = create_mail_run(campaign_id=campaign_id, selection_id=0)
+    skipped_count = (
+        stats.input_inns
+        - stats.clients_found
+        + stats.without_email
+        + stats.invalid_email
+        + stats.duplicate_etrn
+        + stats.bounced_before_send
+    )
+    set_mail_run_preparation_stats(
+        prepare_run_id,
+        input_inns_count=stats.input_inns,
+        clients_found_count=stats.clients_found,
+        clients_without_email_count=stats.without_email,
+        email_found_after_enrichment_count=stats.email_found_after_enrichment,
+        invalid_email_count=stats.invalid_email,
+        duplicate_count=stats.duplicate_etrn,
+        bounced_before_send_count=stats.bounced_before_send,
+        prepared_email_count=stats.queued,
+        skipped_count=skipped_count,
+        pending_count=stats.queued,
+    )
     finish_mail_run(
         prepare_run_id,
         status="success",
@@ -450,6 +478,10 @@ async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
     if jitter_max < jitter_min:
         raise ValueError("Максимальный ETRN jitter меньше минимального")
     run_id = create_mail_run(campaign_id=campaign_id, selection_id=0)
+    copy_latest_mail_run_preparation_stats(
+        campaign_id=campaign_id,
+        target_run_id=run_id,
+    )
     sent = failed = deferred = 0
     try:
         for index, recipient in enumerate(recipients, 1):
@@ -492,12 +524,14 @@ async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
             delivered_count=0, bounced_count=0, deferred_count=deferred,
             failed_count=failed, error_text=type(error).__name__,
         )
+        set_mail_run_pending_count(run_id, campaign_stats()["pending"])
         raise
     finish_mail_run(
         run_id, status="success" if not failed and not deferred else "partial",
         recipients_added=0, sent_count=sent, delivered_count=0,
         bounced_count=0, deferred_count=deferred, failed_count=failed,
     )
+    set_mail_run_pending_count(run_id, campaign_stats()["pending"])
     print(f"ETRN_BATCH_COMPLETE\nsent={sent}\nfailed={failed}\ndeferred={deferred}")
     if batch_count + len(recipients) >= batch_size:
         cooldown_min = _env_int("ETRN_COOLDOWN_MIN_SECONDS", 2400)

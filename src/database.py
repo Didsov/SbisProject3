@@ -1199,6 +1199,17 @@ def initialize_mailing_tables(
             deferred_count INTEGER NOT NULL DEFAULT 0,
             failed_count INTEGER NOT NULL DEFAULT 0,
 
+            input_inns_count INTEGER NOT NULL DEFAULT 0,
+            clients_found_count INTEGER NOT NULL DEFAULT 0,
+            clients_without_email_count INTEGER NOT NULL DEFAULT 0,
+            email_found_after_enrichment_count INTEGER NOT NULL DEFAULT 0,
+            invalid_email_count INTEGER NOT NULL DEFAULT 0,
+            duplicate_count INTEGER NOT NULL DEFAULT 0,
+            bounced_before_send_count INTEGER NOT NULL DEFAULT 0,
+            prepared_email_count INTEGER NOT NULL DEFAULT 0,
+            skipped_count INTEGER NOT NULL DEFAULT 0,
+            pending_count INTEGER NOT NULL DEFAULT 0,
+
             error_text TEXT,
 
             FOREIGN KEY (campaign_id)
@@ -1207,6 +1218,30 @@ def initialize_mailing_tables(
         )
         """
     )
+
+    run_columns = {
+        row["name"]
+        for row in connection.execute(
+            "PRAGMA table_info(mail_runs)"
+        ).fetchall()
+    }
+    for column_name in (
+        "input_inns_count",
+        "clients_found_count",
+        "clients_without_email_count",
+        "email_found_after_enrichment_count",
+        "invalid_email_count",
+        "duplicate_count",
+        "bounced_before_send_count",
+        "prepared_email_count",
+        "skipped_count",
+        "pending_count",
+    ):
+        if column_name not in run_columns:
+            connection.execute(
+                f"ALTER TABLE mail_runs ADD COLUMN {column_name} "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
 
     # До разделения статусов Postfix заменял SMTP-статус
     # значениями delivered/deferred/bounced. Переносим эти значения
@@ -2271,6 +2306,122 @@ def _validate_mail_run_counts(
             )
 
 
+def set_mail_run_preparation_stats(
+    run_id: int,
+    *,
+    input_inns_count: int,
+    clients_found_count: int,
+    clients_without_email_count: int,
+    email_found_after_enrichment_count: int,
+    invalid_email_count: int,
+    duplicate_count: int,
+    bounced_before_send_count: int,
+    prepared_email_count: int,
+    skipped_count: int,
+    pending_count: int,
+) -> None:
+    """Сохранить snapshot подготовки аудитории в существующем mail_runs."""
+    values = (
+        input_inns_count,
+        clients_found_count,
+        clients_without_email_count,
+        email_found_after_enrichment_count,
+        invalid_email_count,
+        duplicate_count,
+        bounced_before_send_count,
+        prepared_email_count,
+        skipped_count,
+        pending_count,
+    )
+    if run_id < 1 or any(value < 0 for value in values):
+        raise ValueError("Некорректная статистика подготовки mail run")
+    with get_connection() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE mail_runs SET
+                input_inns_count = ?,
+                clients_found_count = ?,
+                clients_without_email_count = ?,
+                email_found_after_enrichment_count = ?,
+                invalid_email_count = ?,
+                duplicate_count = ?,
+                bounced_before_send_count = ?,
+                prepared_email_count = ?,
+                skipped_count = ?,
+                pending_count = ?
+            WHERE id = ?
+            """,
+            (*values, run_id),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError(f"mail_runs #{run_id} не найден")
+
+
+def copy_latest_mail_run_preparation_stats(
+    *,
+    campaign_id: int,
+    target_run_id: int,
+) -> None:
+    """Скопировать последний prepare snapshot в новый send-run кампании."""
+    with get_connection() as connection:
+        connection.execute(
+            """
+            UPDATE mail_runs AS target
+            SET (
+                input_inns_count,
+                clients_found_count,
+                clients_without_email_count,
+                email_found_after_enrichment_count,
+                invalid_email_count,
+                duplicate_count,
+                bounced_before_send_count,
+                prepared_email_count,
+                skipped_count,
+                pending_count
+            ) = (
+                SELECT
+                    source.input_inns_count,
+                    source.clients_found_count,
+                    source.clients_without_email_count,
+                    source.email_found_after_enrichment_count,
+                    source.invalid_email_count,
+                    source.duplicate_count,
+                    source.bounced_before_send_count,
+                    source.prepared_email_count,
+                    source.skipped_count,
+                    source.pending_count
+                FROM mail_runs AS source
+                WHERE source.campaign_id = ?
+                  AND source.input_inns_count > 0
+                  AND source.id <> ?
+                ORDER BY source.id DESC
+                LIMIT 1
+            )
+            WHERE target.id = ?
+              AND EXISTS (
+                  SELECT 1 FROM mail_runs AS source
+                  WHERE source.campaign_id = ?
+                    AND source.input_inns_count > 0
+                    AND source.id <> ?
+              )
+            """,
+            (campaign_id, target_run_id, target_run_id, campaign_id, target_run_id),
+        )
+
+
+def set_mail_run_pending_count(run_id: int, pending_count: int) -> None:
+    """Зафиксировать остаток очереди на момент завершения запуска."""
+    if run_id < 1 or pending_count < 0:
+        raise ValueError("Некорректный pending_count mail run")
+    with get_connection() as connection:
+        cursor = connection.execute(
+            "UPDATE mail_runs SET pending_count = ? WHERE id = ?",
+            (pending_count, run_id),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError(f"mail_runs #{run_id} не найден")
+
+
 def update_mail_run_counts(
     run_id: int,
     *,
@@ -2504,6 +2655,7 @@ def get_recent_mail_runs(
                 mr.id AS run_id,
                 mr.campaign_id,
                 mc.name AS campaign_name,
+                mc.campaign_family,
                 mr.selection_id,
                 mr.trigger,
                 mr.status,
@@ -2514,7 +2666,41 @@ def get_recent_mail_runs(
                 mr.delivered_count,
                 mr.bounced_count,
                 mr.deferred_count,
-                mr.failed_count
+                mr.failed_count,
+                mr.input_inns_count,
+                mr.clients_found_count,
+                mr.clients_without_email_count,
+                mr.email_found_after_enrichment_count,
+                mr.invalid_email_count,
+                mr.duplicate_count,
+                mr.bounced_before_send_count,
+                mr.prepared_email_count,
+                mr.skipped_count,
+                mr.pending_count,
+                (
+                    SELECT COUNT(*) FROM mail_events AS event
+                    INNER JOIN mail_messages AS message ON message.id = event.message_id
+                    WHERE message.run_id = mr.id AND message.is_test = 0
+                      AND event.event_type = 'opened'
+                ) AS open_count,
+                (
+                    SELECT COUNT(DISTINCT message.id) FROM mail_events AS event
+                    INNER JOIN mail_messages AS message ON message.id = event.message_id
+                    WHERE message.run_id = mr.id AND message.is_test = 0
+                      AND event.event_type = 'opened'
+                ) AS unique_open_count,
+                (
+                    SELECT COUNT(*) FROM mail_events AS event
+                    INNER JOIN mail_messages AS message ON message.id = event.message_id
+                    WHERE message.run_id = mr.id AND message.is_test = 0
+                      AND event.event_type = 'clicked'
+                ) AS click_count,
+                (
+                    SELECT COUNT(DISTINCT message.id) FROM mail_events AS event
+                    INNER JOIN mail_messages AS message ON message.id = event.message_id
+                    WHERE message.run_id = mr.id AND message.is_test = 0
+                      AND event.event_type = 'clicked'
+                ) AS unique_click_count
             FROM mail_runs AS mr
 
             INNER JOIN mail_campaigns AS mc
@@ -2545,6 +2731,7 @@ def get_latest_mail_run_with_sent_messages(
                 mr.id AS run_id,
                 mr.campaign_id,
                 mc.name AS campaign_name,
+                mc.campaign_family,
                 mr.selection_id,
                 mr.trigger,
                 mr.status,
@@ -2555,7 +2742,41 @@ def get_latest_mail_run_with_sent_messages(
                 mr.delivered_count,
                 mr.bounced_count,
                 mr.deferred_count,
-                mr.failed_count
+                mr.failed_count,
+                mr.input_inns_count,
+                mr.clients_found_count,
+                mr.clients_without_email_count,
+                mr.email_found_after_enrichment_count,
+                mr.invalid_email_count,
+                mr.duplicate_count,
+                mr.bounced_before_send_count,
+                mr.prepared_email_count,
+                mr.skipped_count,
+                mr.pending_count,
+                (
+                    SELECT COUNT(*) FROM mail_events AS event
+                    INNER JOIN mail_messages AS message ON message.id = event.message_id
+                    WHERE message.run_id = mr.id AND message.is_test = 0
+                      AND event.event_type = 'opened'
+                ) AS open_count,
+                (
+                    SELECT COUNT(DISTINCT message.id) FROM mail_events AS event
+                    INNER JOIN mail_messages AS message ON message.id = event.message_id
+                    WHERE message.run_id = mr.id AND message.is_test = 0
+                      AND event.event_type = 'opened'
+                ) AS unique_open_count,
+                (
+                    SELECT COUNT(*) FROM mail_events AS event
+                    INNER JOIN mail_messages AS message ON message.id = event.message_id
+                    WHERE message.run_id = mr.id AND message.is_test = 0
+                      AND event.event_type = 'clicked'
+                ) AS click_count,
+                (
+                    SELECT COUNT(DISTINCT message.id) FROM mail_events AS event
+                    INNER JOIN mail_messages AS message ON message.id = event.message_id
+                    WHERE message.run_id = mr.id AND message.is_test = 0
+                      AND event.event_type = 'clicked'
+                ) AS unique_click_count
             FROM mail_runs AS mr
 
             INNER JOIN mail_campaigns AS mc
@@ -2593,6 +2814,7 @@ def get_mail_run_details(
                 mr.id AS run_id,
                 mr.campaign_id,
                 mc.name AS campaign_name,
+                mc.campaign_family,
                 mr.selection_id,
                 mr.trigger,
                 mr.status,
@@ -2604,6 +2826,40 @@ def get_mail_run_details(
                 mr.bounced_count,
                 mr.deferred_count,
                 mr.failed_count,
+                mr.input_inns_count,
+                mr.clients_found_count,
+                mr.clients_without_email_count,
+                mr.email_found_after_enrichment_count,
+                mr.invalid_email_count,
+                mr.duplicate_count,
+                mr.bounced_before_send_count,
+                mr.prepared_email_count,
+                mr.skipped_count,
+                mr.pending_count,
+                (
+                    SELECT COUNT(*) FROM mail_events AS event
+                    INNER JOIN mail_messages AS message ON message.id = event.message_id
+                    WHERE message.run_id = mr.id AND message.is_test = 0
+                      AND event.event_type = 'opened'
+                ) AS open_count,
+                (
+                    SELECT COUNT(DISTINCT message.id) FROM mail_events AS event
+                    INNER JOIN mail_messages AS message ON message.id = event.message_id
+                    WHERE message.run_id = mr.id AND message.is_test = 0
+                      AND event.event_type = 'opened'
+                ) AS unique_open_count,
+                (
+                    SELECT COUNT(*) FROM mail_events AS event
+                    INNER JOIN mail_messages AS message ON message.id = event.message_id
+                    WHERE message.run_id = mr.id AND message.is_test = 0
+                      AND event.event_type = 'clicked'
+                ) AS click_count,
+                (
+                    SELECT COUNT(DISTINCT message.id) FROM mail_events AS event
+                    INNER JOIN mail_messages AS message ON message.id = event.message_id
+                    WHERE message.run_id = mr.id AND message.is_test = 0
+                      AND event.event_type = 'clicked'
+                ) AS unique_click_count,
                 mr.error_text
             FROM mail_runs AS mr
 
@@ -2640,10 +2896,14 @@ def get_mail_run_messages(
             SELECT
                 mm.id AS message_id,
                 c.name AS company_name,
+                c.inn,
                 mr.email,
                 mm.status AS send_status,
                 mm.delivery_status,
                 mm.sent_at,
+                MAX(
+                    CASE WHEN me.event_type = 'delivered' THEN me.event_at END
+                ) AS delivered_at,
                 SUM(
                     CASE
                         WHEN me.event_type = 'opened'
@@ -2677,6 +2937,7 @@ def get_mail_run_messages(
             GROUP BY
                 mm.id,
                 c.name,
+                c.inn,
                 mr.email,
                 mm.status,
                 mm.delivery_status,
@@ -2773,16 +3034,23 @@ def get_mail_message_details(
             SELECT
                 mm.id AS message_id,
                 mm.run_id,
+                run.status AS run_status,
+                run.started_at AS run_started_at,
                 mr.campaign_id,
                 mc.name AS campaign_name,
+                mc.campaign_family,
                 mr.client_id,
                 c.name AS company_name,
+                c.inn,
                 mr.email,
                 mm.provider,
                 mm.provider_message_id,
                 mm.status AS send_status,
                 mm.delivery_status,
                 mm.sent_at,
+                MAX(
+                    CASE WHEN me.event_type = 'delivered' THEN me.event_at END
+                ) AS delivered_at,
                 mm.tracking_token,
                 SUM(
                     CASE
@@ -2807,6 +3075,9 @@ def get_mail_message_details(
             INNER JOIN mail_campaigns AS mc
                 ON mc.id = mr.campaign_id
 
+            LEFT JOIN mail_runs AS run
+                ON run.id = mm.run_id
+
             INNER JOIN clients AS c
                 ON c.id = mr.client_id
 
@@ -2818,10 +3089,14 @@ def get_mail_message_details(
             GROUP BY
                 mm.id,
                 mm.run_id,
+                run.status,
+                run.started_at,
                 mr.campaign_id,
                 mc.name,
+                mc.campaign_family,
                 mr.client_id,
                 c.name,
+                c.inn,
                 mr.email,
                 mm.provider,
                 mm.provider_message_id,

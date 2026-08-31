@@ -292,6 +292,19 @@ def _message_event_status(
     return _event_status(event_type)
 
 
+def _click_channels(timeline: Sequence[Mapping[str, object]]) -> str:
+    """Собрать каналы кликов сообщения без отдельной tracking-схемы."""
+    channels = {
+        channel
+        for event in timeline
+        if event["event_type"] == "clicked"
+        if (channel := _click_channel(event["event_data"])) is not None
+    }
+    if not channels:
+        return '<span class="muted">—</span>'
+    return escape(", ".join(sorted(channels)))
+
+
 def _duration(started_at: object, finished_at: object) -> str:
     """Вернуть человекочитаемую длительность завершённого запуска."""
     if not started_at or not finished_at:
@@ -455,6 +468,7 @@ async def handle_admin(request: web.Request) -> web.Response:
                     ),
                 ),
                 ("Кампания", _value(latest_run["campaign_name"])),
+                ("Семейство", _value(latest_run["campaign_family"])),
                 ("Selection", _value(latest_run["selection_id"])),
             )
         )
@@ -486,6 +500,8 @@ async def handle_admin(request: web.Request) -> web.Response:
         int(message["clicked_count"] or 0) > 0
         for message in messages
     )
+    open_count = sum(int(message["opened_count"] or 0) for message in messages)
+    click_count = sum(int(message["clicked_count"] or 0) for message in messages)
     mailing_duration = _duration(
         latest_mailing["started_at"],
         latest_mailing["finished_at"],
@@ -494,12 +510,13 @@ async def handle_admin(request: web.Request) -> web.Response:
         heading
         + _metrics(
             (
-                ("Получателей", latest_mailing["recipients_added"]),
+                ("Подготовлено", latest_mailing["prepared_email_count"]),
+                ("Pending", latest_mailing["pending_count"]),
                 ("Отправлено", latest_mailing["sent_count"]),
                 ("Принято сервером", latest_mailing["delivered_count"]),
                 ("Bounce", latest_mailing["bounced_count"]),
-                ("Открыли", opened_count),
-                ("Кликнули", clicked_count),
+                ("Открытия / уник.", f"{open_count} / {opened_count}"),
+                ("Клики / уник.", f"{click_count} / {clicked_count}"),
             )
         )
         + '<section class="panel run-card"><div class="run-card-header">'
@@ -513,6 +530,7 @@ async def handle_admin(request: web.Request) -> web.Response:
                 ("Окончание", _value(latest_mailing["finished_at"])),
                 ("Длительность", escape(mailing_duration)),
                 ("Кампания", _value(latest_mailing["campaign_name"])),
+                ("Семейство", _value(latest_mailing["campaign_family"])),
                 ("Selection", _value(latest_mailing["selection_id"])),
             )
         )
@@ -529,28 +547,38 @@ async def handle_runs(request: web.Request) -> web.Response:
     table = _table(
         headers=(
             "Запуск",
+            "Семейство",
             "Кампания",
             "Начало",
-            "Длительность",
-            "Получатели",
+            "ИНН",
+            "Подготовлено",
+            "Skipped",
+            "Pending",
             "Отправлено",
             "Принято сервером",
             "Bounce",
             "Ошибки",
+            "Открытия / уник.",
+            "Клики / уник.",
             "Статус",
         ),
         rows=(
             (
                 (
                     f'<strong class="numeric">#{_value(run["run_id"])}</strong>',
+                    _value(run["campaign_family"]),
                     _value(run["campaign_name"]),
                     _value(run["started_at"]),
-                    escape(_duration(run["started_at"], run["finished_at"])),
-                    _value(run["recipients_added"]),
+                    _value(run["input_inns_count"]),
+                    _value(run["prepared_email_count"]),
+                    _value(run["skipped_count"]),
+                    _value(run["pending_count"]),
                     _value(run["sent_count"]),
                     _value(run["delivered_count"]),
                     _value(run["bounced_count"]),
                     _value(run["failed_count"]),
+                    f'{_value(run["open_count"])} / {_value(run["unique_open_count"])}',
+                    f'{_value(run["click_count"])} / {_value(run["unique_click_count"])}',
                     _display_run_status(run),
                 ),
                 f'/admin/runs/{int(run["run_id"])}',
@@ -621,18 +649,21 @@ async def handle_run_details(request: web.Request) -> web.Response:
 
     messages_table = _table(
         headers=(
+            "ИНН",
             "Компания",
             "Email",
-            "Отправка",
-            "Доставка",
+            "Статус message",
+            "Delivery status",
+            "Отправлено",
+            "Доставлено",
             "Открытия",
             "Клики",
-            "Отправлено",
             "Последнее событие",
         ),
         rows=(
             (
                 (
+                    _value(message["inn"]),
                     (
                         '<a class="text-link" '
                         f'href="/admin/messages/{int(message["message_id"])}">'
@@ -641,9 +672,10 @@ async def handle_run_details(request: web.Request) -> web.Response:
                     f'<span class="email">{_value(message["email"])}</span>',
                     _send_status(message["send_status"]),
                     _delivery_status(message["delivery_status"]),
+                    _value(message["sent_at"]),
+                    _value(message["delivered_at"]),
                     _value(message["opened_count"]),
                     _value(message["clicked_count"]),
-                    _value(message["sent_at"]),
                     _value(message["last_event_at"]),
                 ),
                 None,
@@ -670,18 +702,43 @@ async def handle_run_details(request: web.Request) -> web.Response:
         empty_text="У запуска нет событий.",
     )
     duration = _duration(details["started_at"], details["finished_at"])
+    preparation = ""
+    if details["campaign_family"] == "etrn":
+        preparation = (
+            "<h2>Подготовка получателей</h2>"
+            '<section class="panel">'
+            + _details(
+                (
+                    ("ИНН во входном списке", _value(details["input_inns_count"])),
+                    ("Клиентов найдено", _value(details["clients_found_count"])),
+                    ("Клиентов без email", _value(details["clients_without_email_count"])),
+                    ("Email после enrichment", _value(details["email_found_after_enrichment_count"])),
+                    ("Invalid email", _value(details["invalid_email_count"])),
+                    ("Duplicate ETRN", _value(details["duplicate_count"])),
+                    ("Bounced до отправки", _value(details["bounced_before_send_count"])),
+                    ("К отправке", _value(details["prepared_email_count"])),
+                )
+            )
+            + "</section>"
+        )
     content = (
         '<div class="page-heading"><div class="eyebrow">История рассылок</div>'
         f'<h1>Запуск #{run_id}</h1>'
         '<p class="subtitle">Результаты отправки, реакции получателей и журнал событий.</p></div>'
         + _metrics(
             (
-                ("Получателей", details["recipients_added"]),
+                ("ИНН обработано", details["input_inns_count"]),
+                ("Email подготовлено", details["prepared_email_count"]),
+                ("Skipped", details["skipped_count"]),
+                ("Pending", details["pending_count"]),
                 ("Отправлено", details["sent_count"]),
-                ("Принято сервером", details["delivered_count"]),
+                ("Failed", details["failed_count"]),
+                ("Delivered", details["delivered_count"]),
                 ("Bounce", details["bounced_count"]),
-                ("Deferred", details["deferred_count"]),
-                ("Ошибки SMTP", details["failed_count"]),
+                ("Открытия", details["open_count"]),
+                ("Уник. открытия", details["unique_open_count"]),
+                ("Клики", details["click_count"]),
+                ("Уник. клики", details["unique_click_count"]),
             )
         )
         + '<section class="panel run-card">'
@@ -689,13 +746,17 @@ async def handle_run_details(request: web.Request) -> web.Response:
             (
                 ("Статус", _display_run_status(details)),
                 ("Кампания", _value(details["campaign_name"])),
+                ("Семейство", _value(details["campaign_family"])),
+                ("Run ID", _value(details["run_id"])),
                 ("Selection", _value(details["selection_id"])),
                 ("Начало", _value(details["started_at"])),
                 ("Окончание", _value(details["finished_at"])),
                 ("Длительность", escape(duration)),
             )
         )
-        + "</section><h2>Сообщения</h2>"
+        + "</section>"
+        + preparation
+        + "<h2>Получатели и сообщения</h2>"
         + messages_table
         + "<h2>Последние события</h2>"
         + events_table
@@ -753,12 +814,16 @@ async def handle_message_details(
     summary = _details(
         (
             ("Компания", _value(details["company_name"])),
+            ("ИНН", _value(details["inn"])),
             (
                 "Email",
                 f'<span class="email">{_value(details["email"])}</span>',
             ),
             ("Кампания", _value(details["campaign_name"])),
+            ("Семейство", _value(details["campaign_family"])),
             ("Run ID", _value(details["run_id"])),
+            ("Статус запуска", _display_run_status({"status": details["run_status"]})),
+            ("Запуск начат", _value(details["run_started_at"])),
             ("Message ID", _value(details["message_id"])),
             (
                 "Статус отправки",
@@ -769,8 +834,10 @@ async def handle_message_details(
                 _delivery_status(details["delivery_status"]),
             ),
             ("Отправлено", _value(details["sent_at"])),
+            ("Доставлено", _value(details["delivered_at"])),
             ("Открытий", _value(details["opened_count"])),
             ("Кликов", _value(details["clicked_count"])),
+            ("Каналы кликов", _click_channels(timeline)),
             ("Последнее событие", _value(details["last_event_at"])),
         )
     )

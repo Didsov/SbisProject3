@@ -308,6 +308,7 @@ class MailRunQueriesTestCase(unittest.TestCase):
                 "run_id",
                 "campaign_id",
                 "campaign_name",
+                "campaign_family",
                 "selection_id",
                 "trigger",
                 "status",
@@ -319,6 +320,20 @@ class MailRunQueriesTestCase(unittest.TestCase):
                 "bounced_count",
                 "deferred_count",
                 "failed_count",
+                "input_inns_count",
+                "clients_found_count",
+                "clients_without_email_count",
+                "email_found_after_enrichment_count",
+                "invalid_email_count",
+                "duplicate_count",
+                "bounced_before_send_count",
+                "prepared_email_count",
+                "skipped_count",
+                "pending_count",
+                "open_count",
+                "unique_open_count",
+                "click_count",
+                "unique_click_count",
             },
         )
         self.assertEqual(runs[0]["run_id"], self.run_empty)
@@ -360,6 +375,7 @@ class MailRunQueriesTestCase(unittest.TestCase):
                 "run_id",
                 "campaign_id",
                 "campaign_name",
+                "campaign_family",
                 "selection_id",
                 "trigger",
                 "status",
@@ -372,6 +388,20 @@ class MailRunQueriesTestCase(unittest.TestCase):
                 "deferred_count",
                 "failed_count",
                 "error_text",
+                "input_inns_count",
+                "clients_found_count",
+                "clients_without_email_count",
+                "email_found_after_enrichment_count",
+                "invalid_email_count",
+                "duplicate_count",
+                "bounced_before_send_count",
+                "prepared_email_count",
+                "skipped_count",
+                "pending_count",
+                "open_count",
+                "unique_open_count",
+                "click_count",
+                "unique_click_count",
             },
         )
         self.assertEqual(details["run_id"], self.run_b)
@@ -388,6 +418,14 @@ class MailRunQueriesTestCase(unittest.TestCase):
         with self.assertRaises(ValueError):
             database.get_mail_run_details(0)
 
+    def test_run_engagement_aggregates_exclude_test_messages(self) -> None:
+        details = database.get_mail_run_details(self.run_a)
+
+        self.assertEqual(details["open_count"], 2)
+        self.assertEqual(details["unique_open_count"], 1)
+        self.assertEqual(details["click_count"], 1)
+        self.assertEqual(details["unique_click_count"], 1)
+
     def test_get_mail_run_messages_excludes_test_by_default(self) -> None:
         messages = database.get_mail_run_messages(self.run_a)
 
@@ -397,10 +435,12 @@ class MailRunQueriesTestCase(unittest.TestCase):
             {
                 "message_id",
                 "company_name",
+                "inn",
                 "email",
                 "send_status",
                 "delivery_status",
                 "sent_at",
+                "delivered_at",
                 "opened_count",
                 "clicked_count",
                 "last_event_at",
@@ -414,6 +454,7 @@ class MailRunQueriesTestCase(unittest.TestCase):
         )
         self.assertEqual(messages[0]["send_status"], "sent")
         self.assertEqual(messages[0]["delivery_status"], "delivered")
+        self.assertEqual(messages[0]["delivered_at"], "2026-08-19 09:02:00")
         self.assertEqual(messages[0]["opened_count"], 2)
         self.assertEqual(messages[0]["clicked_count"], 1)
         self.assertEqual(
