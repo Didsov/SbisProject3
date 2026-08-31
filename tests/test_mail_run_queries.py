@@ -439,6 +439,8 @@ class MailRunQueriesTestCase(unittest.TestCase):
                 "company_name",
                 "inn",
                 "email",
+                "smtp_recipient_email",
+                "is_test_recipient",
                 "send_status",
                 "delivery_status",
                 "sent_at",

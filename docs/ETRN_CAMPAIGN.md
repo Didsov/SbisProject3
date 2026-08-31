@@ -24,6 +24,12 @@ python -m src.mailing.etrn send --dry-run
 python -m src.mailing.etrn stats
 ```
 
+Проверить batch limit и тестовую SMTP-подмену без БД и отправки:
+
+```powershell
+python -m src.mailing.etrn config
+```
+
 Реальная отправка существует только за явным флагом и не должна запускаться во
 время разработки:
 
@@ -127,11 +133,26 @@ until=2026-08-31T12:34:56+00:00
 
 ## Jitter и конфигурация
 
+### Безопасная подмена SMTP-получателей
+
+При `ETRN_TEST_RECIPIENTS_ENABLED=true` каждый реальный recipient продолжает
+создавать обычный `mail_messages`, но непосредственно перед `SMTP.send()` поле
+`MailMessage.to_email` заменяется адресом из `ETRN_TEST_RECIPIENTS`. Адреса
+распределяются по кругу внутри каждого batch. Реальный email остаётся в
+`mail_recipients.email`, а фактический адрес и признак подмены сохраняются в
+`mail_messages.smtp_recipient_email` и `mail_messages.is_test_recipient`.
+
+Если режим включён, но список пуст или содержит некорректный адрес, worker
+останавливается до создания run/message и никогда не переключается на реальные
+email. В лог выводятся только факт включения и количество адресов.
+
 Переменные окружения и значения по умолчанию:
 
 | Переменная | Значение |
 |---|---:|
-| `ETRN_BATCH_SIZE` | `500` |
+| `ETRN_BATCH_LIMIT` | `500` |
+| `ETRN_TEST_RECIPIENTS_ENABLED` | `false` |
+| `ETRN_TEST_RECIPIENTS` | пусто |
 | `ETRN_MESSAGE_DELAY_MIN_SECONDS` | `6` |
 | `ETRN_MESSAGE_DELAY_MAX_SECONDS` | `8` |
 | `ETRN_COOLDOWN_MIN_SECONDS` | `2400` |
@@ -139,7 +160,9 @@ until=2026-08-31T12:34:56+00:00
 | `ETRN_RETRY_FIRST_SECONDS` | `60` |
 | `ETRN_RETRY_SECOND_SECONDS` | `300` |
 
-Даже если `ETRN_BATCH_SIZE` больше 500, worker применяет предел 500.
+Даже если `ETRN_BATCH_LIMIT` больше 500, worker применяет предел 500. Для
+совместимости существующий `ETRN_BATCH_SIZE` читается только как fallback, если
+новая переменная отсутствует.
 
 ## Шаблон и персонализация
 

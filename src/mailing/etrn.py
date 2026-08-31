@@ -9,7 +9,7 @@ import os
 import random
 import re
 from contextlib import closing
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -55,6 +55,62 @@ def _env_int(name: str, default: int) -> int:
     if value < 0:
         raise ValueError(f"{name} не может быть отрицательным")
     return value
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    value = raw_value.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{name} должен быть true или false, получено {raw_value!r}"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class TestRecipientConfig:
+    enabled: bool
+    recipients: tuple[str, ...]
+
+
+def get_batch_limit() -> int:
+    """Получить размер ETRN batch с пределом 500 и legacy fallback."""
+    raw_limit = os.getenv("ETRN_BATCH_LIMIT")
+    if raw_limit is None:
+        limit = _env_int("ETRN_BATCH_SIZE", 500)
+    else:
+        limit = _env_int("ETRN_BATCH_LIMIT", 500)
+    if limit < 1:
+        raise ValueError("ETRN_BATCH_LIMIT должен быть больше 0")
+    return min(limit, 500)
+
+
+def get_test_recipient_config() -> TestRecipientConfig:
+    """Прочитать fail-closed конфигурацию SMTP-подмены получателей."""
+    enabled = _env_bool("ETRN_TEST_RECIPIENTS_ENABLED", False)
+    if not enabled:
+        return TestRecipientConfig(enabled=False, recipients=())
+
+    raw_recipients = os.getenv("ETRN_TEST_RECIPIENTS", "")
+    values = [value.strip() for value in raw_recipients.split(",")]
+    if not raw_recipients.strip() or any(not value for value in values):
+        raise ValueError(
+            "ETRN_TEST_RECIPIENTS_ENABLED=true, но список "
+            "ETRN_TEST_RECIPIENTS пуст или содержит пустой адрес"
+        )
+
+    recipients = tuple(normalize_email(value) for value in values)
+    invalid = [value for value in recipients if not is_valid_email(value)]
+    if invalid:
+        raise ValueError(
+            "ETRN_TEST_RECIPIENTS содержит некорректные email; "
+            f"количество ошибок: {len(invalid)}"
+        )
+    return TestRecipientConfig(enabled=True, recipients=recipients)
 
 
 @dataclass(slots=True)
@@ -467,12 +523,16 @@ def _cooldown_duration() -> int:
 async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
     if not dry_run and not confirm_real_send:
         raise ValueError("Для реальной отправки требуется --confirm-real-send")
+    batch_size = get_batch_limit()
+    test_config = get_test_recipient_config()
+    if test_config.enabled:
+        print(
+            "ETRN TEST RECIPIENT MODE ENABLED\n"
+            f"configured_test_recipients={len(test_config.recipients)}"
+        )
     initialize_database()
     campaign_id = ensure_etrn_campaign()
     attachments = load_attachments()
-    batch_size = min(_env_int("ETRN_BATCH_SIZE", 500), 500)
-    if batch_size < 1:
-        raise ValueError("ETRN_BATCH_SIZE должен быть больше 0")
     template = get_mail_template(TEMPLATE_NAME)
     if dry_run:
         recipients = _eligible_recipients(
@@ -487,7 +547,10 @@ async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
         for index, recipient in enumerate(recipients, 1):
             message = build_mail_message(recipient, template)
             message.attachments = attachments
-            print(f"[{index}/{len(recipients)}] {message.to_email} -> DRY_RUN")
+            print(
+                f"[{index}/{len(recipients)}] "
+                f"recipient_id={message.recipient_id} -> DRY_RUN"
+            )
         print("Dry-run завершён: SMTP и БД очереди не изменялись.")
         return
 
@@ -557,10 +620,18 @@ async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
         sent = failed = deferred = 0
         try:
             for index, recipient in enumerate(recipients, 1):
+                real_email = normalize_email(str(recipient["email"]))
+                smtp_email = (
+                    test_config.recipients[(index - 1) % len(test_config.recipients)]
+                    if test_config.enabled
+                    else real_email
+                )
                 record = create_mail_message(
                     recipient_id=int(recipient["recipient_id"]),
                     provider="smtp",
                     run_id=run_id,
+                    smtp_recipient_email=smtp_email,
+                    is_test_recipient=test_config.enabled,
                 )
                 message: MailMessage = build_mail_message(
                     recipient,
@@ -568,7 +639,8 @@ async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
                     tracking_token=str(record["tracking_token"]),
                 )
                 message.attachments = attachments
-                result = await provider.send(message)
+                outbound_message = replace(message, to_email=smtp_email)
+                result = await provider.send(outbound_message)
                 complete_mail_message(
                     message_id=int(record["message_id"]),
                     provider_message_id=result.provider_message_id,
@@ -595,7 +667,10 @@ async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
                         failed += 1
                         _record_attempt(message.recipient_id, attempts, error)
                         outcome = "failed"
-                print(f"[{index}/{len(recipients)}] {message.to_email} -> {outcome}")
+                print(
+                    f"[{index}/{len(recipients)}] "
+                    f"recipient_id={message.recipient_id} -> {outcome}"
+                )
                 if index < len(recipients):
                     await asyncio.sleep(random.randint(jitter_min, jitter_max))
         except BaseException as error:
@@ -680,6 +755,15 @@ def campaign_stats() -> dict[str, int]:
     return result
 
 
+def print_configuration() -> None:
+    """Показать безопасную ETRN-конфигурацию без БД и SMTP."""
+    test_config = get_test_recipient_config()
+    mode = "ENABLED" if test_config.enabled else "DISABLED"
+    print(f"ETRN test recipient mode: {mode}")
+    print(f"Configured test recipients: {len(test_config.recipients)}")
+    print(f"Batch limit: {get_batch_limit()}")
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Кампания ЭТрН")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -690,6 +774,7 @@ def parse_arguments() -> argparse.Namespace:
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--confirm-real-send", action="store_true")
     commands.add_parser("stats", help="Показать состояние очереди")
+    commands.add_parser("config", help="Проверить конфигурацию без отправки")
     return parser.parse_args()
 
 
@@ -702,9 +787,11 @@ def main() -> None:
             dry_run=arguments.dry_run,
             confirm_real_send=arguments.confirm_real_send,
         ))
-    else:
+    elif arguments.command == "stats":
         for key, value in sorted(campaign_stats().items()):
             print(f"{key}: {value}")
+    else:
+        print_configuration()
 
 
 if __name__ == "__main__":

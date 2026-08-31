@@ -128,6 +128,11 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
                     "PRAGMA table_info(mail_recipients)"
                 ).fetchall()
             }
+            message_columns = {
+                row["name"] for row in connection.execute(
+                    "PRAGMA table_info(mail_messages)"
+                ).fetchall()
+            }
             run_columns = {
                 row["name"] for row in connection.execute(
                     "PRAGMA table_info(mail_runs)"
@@ -136,6 +141,10 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
             quick_check = connection.execute("PRAGMA quick_check").fetchone()[0]
         self.assertTrue({"campaign_family", "next_send_at", "batch_sent_count"} <= campaign_columns)
         self.assertTrue({"normalized_email", "attempt_count", "next_attempt_at"} <= recipient_columns)
+        self.assertTrue({
+            "smtp_recipient_email",
+            "is_test_recipient",
+        } <= message_columns)
         self.assertTrue({
             "input_inns_count",
             "clients_found_count",
@@ -184,6 +193,163 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
         ):
             await etrn.send_campaign(dry_run=True, confirm_real_send=False)
 
+    def test_config_command_reports_mode_count_and_batch_without_send(self) -> None:
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "ETRN_BATCH_LIMIT": "4",
+                    "ETRN_TEST_RECIPIENTS_ENABLED": "true",
+                    "ETRN_TEST_RECIPIENTS": "first@example.ru,second@example.ru",
+                },
+            ),
+            redirect_stdout(output := io.StringIO()),
+        ):
+            etrn.print_configuration()
+
+        self.assertEqual(
+            output.getvalue().splitlines(),
+            [
+                "ETRN test recipient mode: ENABLED",
+                "Configured test recipients: 2",
+                "Batch limit: 4",
+            ],
+        )
+
+    async def test_enabled_test_mode_with_invalid_list_fails_before_database(self) -> None:
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "ETRN_TEST_RECIPIENTS_ENABLED": "true",
+                    "ETRN_TEST_RECIPIENTS": "invalid-address",
+                },
+            ),
+            patch.object(etrn, "initialize_database") as initialize,
+            self.assertRaisesRegex(ValueError, "некорректные email"),
+        ):
+            await etrn.send_campaign(
+                dry_run=False,
+                confirm_real_send=True,
+            )
+
+        initialize.assert_not_called()
+
+    def test_batch_limit_prefers_new_setting_and_caps_at_500(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"ETRN_BATCH_LIMIT": "900", "ETRN_BATCH_SIZE": "2"},
+        ):
+            self.assertEqual(etrn.get_batch_limit(), 500)
+
+    async def test_test_recipients_cycle_without_changing_real_audience(self) -> None:
+        first_client = self.add_client(
+            "2500000040",
+            ["real-one@example.ru", "real-two@example.ru"],
+        )
+        second_client = self.add_client(
+            "2500000041",
+            ["real-three@example.ru"],
+        )
+        campaign_id = etrn.ensure_etrn_campaign()
+        self.assertTrue(
+            etrn._queue_email(campaign_id, first_client, "real-one@example.ru")
+        )
+        self.assertTrue(
+            etrn._queue_email(campaign_id, first_client, "real-two@example.ru")
+        )
+        self.assertTrue(
+            etrn._queue_email(campaign_id, second_client, "real-three@example.ru")
+        )
+        attachment_dir = self.root / "attachments-test-recipient"
+        attachment_dir.mkdir()
+        for filename in etrn.ATTACHMENT_FILENAMES:
+            (attachment_dir / filename).write_bytes(b"%PDF-test")
+        provider = AsyncMock()
+        provider.send.return_value = SMTPSendResult(True, "message-id")
+
+        with (
+            patch.object(etrn, "ATTACHMENTS_DIR", attachment_dir),
+            patch.object(etrn.SMTPMailProvider, "from_env", return_value=provider),
+            patch.object(etrn.asyncio, "sleep", new=AsyncMock()),
+            patch.dict(
+                "os.environ",
+                {
+                    "ETRN_BATCH_LIMIT": "3",
+                    "ETRN_TEST_RECIPIENTS_ENABLED": "true",
+                    "ETRN_TEST_RECIPIENTS": (
+                        "test-a@example.ru,test-b@example.ru"
+                    ),
+                    "ETRN_MESSAGE_DELAY_MIN_SECONDS": "0",
+                    "ETRN_MESSAGE_DELAY_MAX_SECONDS": "0",
+                },
+            ),
+            redirect_stdout(output := io.StringIO()),
+        ):
+            await etrn.send_campaign(
+                dry_run=False,
+                confirm_real_send=True,
+            )
+
+        smtp_addresses = [
+            call.args[0].to_email
+            for call in provider.send.await_args_list
+        ]
+        self.assertEqual(
+            smtp_addresses,
+            ["test-a@example.ru", "test-b@example.ru", "test-a@example.ru"],
+        )
+        with closing(database.get_connection()) as connection:
+            recipients = connection.execute(
+                """
+                SELECT email, status, client_id FROM mail_recipients
+                WHERE campaign_id = ? ORDER BY id
+                """,
+                (campaign_id,),
+            ).fetchall()
+            messages = connection.execute(
+                """
+                SELECT smtp_recipient_email, is_test_recipient, is_test,
+                       recipient_id, tracking_token
+                FROM mail_messages ORDER BY id
+                """
+            ).fetchall()
+        self.assertEqual(
+            [row["email"] for row in recipients],
+            [
+                "real-one@example.ru",
+                "real-two@example.ru",
+                "real-three@example.ru",
+            ],
+        )
+        self.assertEqual([row["status"] for row in recipients], ["sent"] * 3)
+        self.assertEqual(
+            [row["smtp_recipient_email"] for row in messages],
+            smtp_addresses,
+        )
+        self.assertEqual([row["is_test_recipient"] for row in messages], [1] * 3)
+        self.assertEqual([row["is_test"] for row in messages], [0] * 3)
+        self.assertEqual(len({row["recipient_id"] for row in messages}), 3)
+        self.assertTrue(all(row["tracking_token"] for row in messages))
+        first_token = str(messages[0]["tracking_token"])
+        self.assertTrue(database.record_mail_open(first_token))
+        self.assertTrue(database.record_mail_click(
+            tracking_token=first_token,
+            click_key="whatsapp",
+        ))
+        tracked_message = database.get_mail_message_details(1)
+        assert tracked_message is not None
+        self.assertEqual(tracked_message["opened_count"], 1)
+        self.assertEqual(tracked_message["clicked_count"], 1)
+        self.assertEqual(
+            tracked_message["smtp_recipient_email"],
+            "test-a@example.ru",
+        )
+        self.assertEqual(tracked_message["is_test_recipient"], 1)
+        self.assertIn("ETRN TEST RECIPIENT MODE ENABLED", output.getvalue())
+        for email in smtp_addresses + [row["email"] for row in recipients]:
+            self.assertNotIn(email, output.getvalue())
+
     async def test_real_worker_uses_persistent_batch_cooldown(self) -> None:
         for number in range(3):
             client_id = self.add_client(
@@ -210,7 +376,8 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
             patch.dict(
                 "os.environ",
                 {
-                    "ETRN_BATCH_SIZE": "2",
+                    "ETRN_BATCH_LIMIT": "2",
+                    "ETRN_TEST_RECIPIENTS_ENABLED": "false",
                     "ETRN_MESSAGE_DELAY_MIN_SECONDS": "0",
                     "ETRN_MESSAGE_DELAY_MAX_SECONDS": "0",
                     "ETRN_COOLDOWN_MIN_SECONDS": "2400",
@@ -242,7 +409,8 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
             patch.dict(
                 "os.environ",
                 {
-                    "ETRN_BATCH_SIZE": "2",
+                    "ETRN_BATCH_LIMIT": "2",
+                    "ETRN_TEST_RECIPIENTS_ENABLED": "false",
                     "ETRN_MESSAGE_DELAY_MIN_SECONDS": "0",
                     "ETRN_MESSAGE_DELAY_MAX_SECONDS": "0",
                     "ETRN_COOLDOWN_MIN_SECONDS": "2400",
@@ -299,6 +467,7 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
                     "ETRN_MESSAGE_DELAY_MIN_SECONDS": "0",
                     "ETRN_MESSAGE_DELAY_MAX_SECONDS": "0",
                     "ETRN_RETRY_FIRST_SECONDS": "60",
+                    "ETRN_TEST_RECIPIENTS_ENABLED": "false",
                 },
             ),
             redirect_stdout(io.StringIO()),

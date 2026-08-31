@@ -1105,6 +1105,10 @@ def initialize_mailing_tables(
 
             is_test INTEGER NOT NULL DEFAULT 0,
 
+            smtp_recipient_email TEXT,
+
+            is_test_recipient INTEGER NOT NULL DEFAULT 0,
+
             status TEXT NOT NULL DEFAULT 'pending',
 
             delivery_status TEXT NOT NULL DEFAULT 'unknown',
@@ -1149,6 +1153,20 @@ def initialize_mailing_tables(
                 ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0
                 """
             )
+    if "smtp_recipient_email" not in message_columns:
+        connection.execute(
+            """
+            ALTER TABLE mail_messages
+            ADD COLUMN smtp_recipient_email TEXT
+            """
+        )
+    if "is_test_recipient" not in message_columns:
+        connection.execute(
+            """
+            ALTER TABLE mail_messages
+            ADD COLUMN is_test_recipient INTEGER NOT NULL DEFAULT 0
+            """
+        )
     if "delivery_status" not in message_columns:
         connection.execute(
             """
@@ -2953,6 +2971,9 @@ def get_mail_run_messages(
                 c.name AS company_name,
                 c.inn,
                 mr.email,
+                COALESCE(mm.smtp_recipient_email, mr.email)
+                    AS smtp_recipient_email,
+                mm.is_test_recipient,
                 mm.status AS send_status,
                 mm.delivery_status,
                 mm.sent_at,
@@ -2994,6 +3015,8 @@ def get_mail_run_messages(
                 c.name,
                 c.inn,
                 mr.email,
+                mm.smtp_recipient_email,
+                mm.is_test_recipient,
                 mm.status,
                 mm.delivery_status,
                 mm.sent_at
@@ -3099,6 +3122,9 @@ def get_mail_message_details(
                 c.name AS company_name,
                 c.inn,
                 mr.email,
+                COALESCE(mm.smtp_recipient_email, mr.email)
+                    AS smtp_recipient_email,
+                mm.is_test_recipient,
                 mm.provider,
                 mm.provider_message_id,
                 mm.status AS send_status,
@@ -3155,6 +3181,8 @@ def get_mail_message_details(
                 c.name,
                 c.inn,
                 mr.email,
+                mm.smtp_recipient_email,
+                mm.is_test_recipient,
                 mm.provider,
                 mm.provider_message_id,
                 mm.status,
@@ -3216,6 +3244,8 @@ def create_mail_message(
     provider: str,
     is_test: bool = False,
     run_id: int | None = None,
+    smtp_recipient_email: str | None = None,
+    is_test_recipient: bool = False,
 ) -> dict:
     """
     Создать попытку отправки письма до обращения к SMTP.
@@ -3242,6 +3272,14 @@ def create_mail_message(
             ID запуска mail_runs. Для прямых запусков sender вне daily-run
             остаётся None.
 
+        smtp_recipient_email:
+            Фактический адрес SMTP envelope/header. Реальный адрес клиента
+            остаётся в mail_recipients.email.
+
+        is_test_recipient:
+            Признак явной транспортной подмены адресата. Это не is_test:
+            сообщение остаётся обычной попыткой и обновляет очередь.
+
     Возвращает:
         Словарь:
         {
@@ -3266,6 +3304,16 @@ def create_mail_message(
     if run_id is not None and run_id < 1:
         raise ValueError(
             "run_id должен быть больше 0 или равен None"
+        )
+
+    clean_smtp_recipient = (
+        smtp_recipient_email.strip()
+        if smtp_recipient_email is not None
+        else None
+    )
+    if is_test_recipient and not clean_smtp_recipient:
+        raise ValueError(
+            "Для test recipient требуется smtp_recipient_email"
         )
 
     clean_provider = provider.strip()
@@ -3310,9 +3358,11 @@ def create_mail_message(
                 provider,
                 status,
                 tracking_token,
-                is_test
+                is_test,
+                smtp_recipient_email,
+                is_test_recipient
             )
-            VALUES (?, ?, ?, 'pending', ?, ?)
+            VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)
             """,
             (
                 recipient_id,
@@ -3320,6 +3370,8 @@ def create_mail_message(
                 clean_provider,
                 tracking_token,
                 int(is_test),
+                clean_smtp_recipient,
+                int(is_test_recipient),
             ),
         )
 

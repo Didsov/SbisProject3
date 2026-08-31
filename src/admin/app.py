@@ -292,6 +292,12 @@ def _message_event_status(
     return _event_status(event_type)
 
 
+def _test_recipient_status(value: object) -> str:
+    if bool(value):
+        return '<span class="status status-partial">TEST RECIPIENT</span>'
+    return '<span class="muted">Нет</span>'
+
+
 def _click_channels(timeline: Sequence[Mapping[str, object]]) -> str:
     """Собрать каналы кликов сообщения без отдельной tracking-схемы."""
     channels = {
@@ -655,7 +661,9 @@ async def handle_run_details(request: web.Request) -> web.Response:
         headers=(
             "ИНН",
             "Компания",
-            "Email",
+            "Email клиента",
+            "SMTP email",
+            "Test recipient",
             "Статус message",
             "Delivery status",
             "Отправлено",
@@ -674,6 +682,11 @@ async def handle_run_details(request: web.Request) -> web.Response:
                         f'{_value(message["company_name"])}</a>'
                     ),
                     f'<span class="email">{_value(message["email"])}</span>',
+                    (
+                        '<span class="email">'
+                        f'{_value(message["smtp_recipient_email"])}</span>'
+                    ),
+                    _test_recipient_status(message["is_test_recipient"]),
                     _send_status(message["send_status"]),
                     _delivery_status(message["delivery_status"]),
                     _value(message["sent_at"]),
@@ -821,8 +834,17 @@ async def handle_message_details(
             ("Компания", _value(details["company_name"])),
             ("ИНН", _value(details["inn"])),
             (
-                "Email",
+                "Email клиента",
                 f'<span class="email">{_value(details["email"])}</span>',
+            ),
+            (
+                "Фактический SMTP email",
+                '<span class="email">'
+                f'{_value(details["smtp_recipient_email"])}</span>',
+            ),
+            (
+                "Test recipient",
+                _test_recipient_status(details["is_test_recipient"]),
             ),
             ("Кампания", _value(details["campaign_name"])),
             ("Семейство", _value(details["campaign_family"])),

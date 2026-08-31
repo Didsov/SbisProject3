@@ -209,6 +209,8 @@ class MailMessageQueriesTestCase(unittest.TestCase):
                 "company_name",
                 "inn",
                 "email",
+                "smtp_recipient_email",
+                "is_test_recipient",
                 "provider",
                 "provider_message_id",
                 "send_status",

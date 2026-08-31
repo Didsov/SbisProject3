@@ -66,6 +66,8 @@ MESSAGES = [
         "company_name": "Company <One>",
         "inn": "9900000001",
         "email": "one@example.invalid",
+        "smtp_recipient_email": "one@example.invalid",
+        "is_test_recipient": 0,
         "send_status": "sent",
         "delivery_status": "delivered",
         "sent_at": "2026-08-20 09:01:00",
@@ -89,6 +91,8 @@ MESSAGE_DETAILS = {
     "company_name": "Company <One>",
     "inn": "9900000001",
     "email": "one@example.invalid",
+    "smtp_recipient_email": "one@example.invalid",
+    "is_test_recipient": 0,
     "provider": "smtp",
     "provider_message_id": "provider-<unsafe>",
     "send_status": "sent",
@@ -440,6 +444,36 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn('<details class="event-data">', page_html)
         self.get_message_details.assert_called_once_with(21)
         self.get_message_timeline.assert_called_once_with(21)
+
+    async def test_test_recipient_message_shows_real_and_smtp_email(self) -> None:
+        self.get_message_details.return_value = {
+            **MESSAGE_DETAILS,
+            "email": "real-client@example.invalid",
+            "smtp_recipient_email": "test-inbox@example.invalid",
+            "is_test_recipient": 1,
+        }
+        self.get_messages.return_value = [
+            {
+                **MESSAGES[0],
+                "email": "real-client@example.invalid",
+                "smtp_recipient_email": "test-inbox@example.invalid",
+                "is_test_recipient": 1,
+            }
+        ]
+
+        message_response = await self.client.get("/admin/messages/21")
+        message_html = await message_response.text()
+        run_response = await self.client.get("/admin/runs/7")
+        run_html = await run_response.text()
+
+        self.assertEqual(message_response.status, 200)
+        self.assertEqual(run_response.status, 200)
+        for page_html in (message_html, run_html):
+            self.assertIn("real-client@example.invalid", page_html)
+            self.assertIn("test-inbox@example.invalid", page_html)
+            self.assertIn("TEST RECIPIENT", page_html)
+        self.assertIn("Фактический SMTP email", message_html)
+        self.assertIn("Email клиента", run_html)
 
     async def test_message_without_run_links_to_runs_list(self) -> None:
         self.get_message_details.return_value = {
