@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from src.client_loader import request_with_network_retries
+from src.client_loader import load_clients_by_inn, request_with_network_retries
 from src.config import PROJECT_ROOT
 from src.database import (
     complete_mail_message,
@@ -201,6 +201,25 @@ def _client_by_inn(inn: str) -> dict[str, object] | None:
     return dict(row) if row else None
 
 
+async def _load_missing_client_from_sbis(
+    inn: str,
+    *,
+    source_value: str,
+) -> dict[str, object] | None:
+    found_clients = await load_clients_by_inn(
+        [inn],
+        source_type="inn_file",
+        source_value=source_value,
+    )
+    if not found_clients:
+        return None
+
+    client = _client_by_inn(inn)
+    if client is None:
+        raise RuntimeError("SBIS client was found but was not saved in clients")
+    return client
+
+
 def _emails(client_id: int) -> list[str]:
     with closing(get_connection()) as connection, connection:
         rows = connection.execute(
@@ -267,8 +286,22 @@ async def prepare_audience(inn_file: Path) -> tuple[int, PrepareStats]:
     for inn in inns:
         client = _client_by_inn(inn)
         if client is None:
-            _audit(campaign_id, "client_not_found", source_value=inn)
-            continue
+            try:
+                client = await _load_missing_client_from_sbis(
+                    inn,
+                    source_value=inn_file.name,
+                )
+            except Exception as error:
+                _audit(
+                    campaign_id,
+                    "sbis_lookup_failed",
+                    source_value=inn,
+                    event_data=type(error).__name__,
+                )
+                continue
+            if client is None:
+                _audit(campaign_id, "client_not_found", source_value=inn)
+                continue
         stats.clients_found += 1
         client_id = int(client["id"])
         emails = _emails(client_id)
@@ -747,7 +780,10 @@ def campaign_stats() -> dict[str, int]:
         ).fetchone()
         for field in ("delivered", "bounced", "opens", "clicks"):
             result[field] = int(delivery[field] or 0)
-        for event_type in ("client_not_found", "no_email", "enrichment_failed", "invalid_email", "duplicate_etrn", "bounced"):
+        for event_type in (
+            "client_not_found", "sbis_lookup_failed", "no_email",
+            "enrichment_failed", "invalid_email", "duplicate_etrn", "bounced",
+        ):
             result[f"skipped_{event_type}"] = int(connection.execute(
                 "SELECT COUNT(*) FROM mail_audience_events WHERE campaign_id = ? AND event_type = ?",
                 (campaign_id, event_type),

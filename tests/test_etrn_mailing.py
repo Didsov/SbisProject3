@@ -61,6 +61,7 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(etrn, "_enrich_client", new=AsyncMock()),
+            patch.object(etrn, "load_clients_by_inn", new=AsyncMock(return_value=[])),
             redirect_stdout(io.StringIO()),
         ):
             campaign_id, stats = await etrn.prepare_audience(inn_file)
@@ -97,6 +98,144 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["duplicate_etrn"], 1)
         self.assertEqual(snapshot["queued"], 2)
         self.assertEqual(snapshot["skipped_count"], 4)
+
+    async def test_prepare_loads_missing_client_then_uses_regular_enrichment(self) -> None:
+        inn = "7725806898"
+        inn_file = self.root / "fallback.txt"
+        inn_file.write_text(f"{inn}\n", encoding="utf-8")
+
+        async def load_client(
+            inns: list[str], *, source_type: str, source_value: str,
+        ) -> list[dict[str, str]]:
+            self.assertEqual(inns, [inn])
+            client_id = database.upsert_client_by_inn_lookup(
+                inn=inn,
+                spp_uuid="4e450d9b-81b7-4bc4-b71a-a5dfb83116a8",
+            )
+            database.add_client_source(
+                client_id=client_id,
+                source_type=source_type,
+                source_value=source_value,
+            )
+            return [{"inn": inn, "spp_uuid": "4e450d9b-81b7-4bc4-b71a-a5dfb83116a8"}]
+
+        async def enrich(client: dict[str, object]) -> None:
+            with closing(database.get_connection()) as connection, connection:
+                connection.execute(
+                    "INSERT INTO client_contacts (client_id, contact_type, value) VALUES (?, 'email', ?)",
+                    (int(client["id"]), "fallback@example.ru"),
+                )
+
+        lookup = AsyncMock(side_effect=load_client)
+        with (
+            patch.object(etrn, "load_clients_by_inn", new=lookup),
+            patch.object(etrn, "_enrich_client", new=AsyncMock(side_effect=enrich)) as enrichment,
+            redirect_stdout(io.StringIO()),
+        ):
+            campaign_id, first_stats = await etrn.prepare_audience(inn_file)
+            _, second_stats = await etrn.prepare_audience(inn_file)
+
+        self.assertEqual(lookup.await_count, 1)
+        lookup.assert_awaited_once_with(
+            [inn], source_type="inn_file", source_value=inn_file.name,
+        )
+        enrichment.assert_awaited_once()
+        self.assertEqual(first_stats.clients_found, 1)
+        self.assertEqual(first_stats.email_found_after_enrichment, 1)
+        self.assertEqual(first_stats.queued, 1)
+        self.assertEqual(second_stats.clients_found, 1)
+        self.assertEqual(second_stats.duplicate_etrn, 1)
+        with closing(database.get_connection()) as connection:
+            client = connection.execute(
+                "SELECT id, spp_uuid FROM clients WHERE inn = ?", (inn,),
+            ).fetchone()
+            source = connection.execute(
+                "SELECT source_type, source_value FROM client_sources WHERE client_id = ?",
+                (client["id"],),
+            ).fetchone()
+            recipient = connection.execute(
+                "SELECT normalized_email FROM mail_recipients WHERE campaign_id = ?",
+                (campaign_id,),
+            ).fetchone()
+        self.assertEqual(client["spp_uuid"], "4e450d9b-81b7-4bc4-b71a-a5dfb83116a8")
+        self.assertEqual(dict(source), {"source_type": "inn_file", "source_value": inn_file.name})
+        self.assertEqual(recipient["normalized_email"], "fallback@example.ru")
+
+    async def test_prepare_distinguishes_sbis_not_found_from_lookup_failure(self) -> None:
+        inn = "7725806898"
+        inn_file = self.root / "fallback.txt"
+        inn_file.write_text(f"{inn}\n", encoding="utf-8")
+
+        with (
+            patch.object(etrn, "load_clients_by_inn", new=AsyncMock(return_value=[])),
+            redirect_stdout(io.StringIO()),
+        ):
+            campaign_id, _ = await etrn.prepare_audience(inn_file)
+
+        with closing(database.get_connection()) as connection:
+            not_found_reasons = [row["event_type"] for row in connection.execute(
+                "SELECT event_type FROM mail_audience_events WHERE campaign_id = ?",
+                (campaign_id,),
+            ).fetchall()]
+            connection.execute(
+                "DELETE FROM mail_audience_events WHERE campaign_id = ?", (campaign_id,),
+            )
+            connection.commit()
+        self.assertIn("client_not_found", not_found_reasons)
+        self.assertNotIn("sbis_lookup_failed", not_found_reasons)
+
+        with (
+            patch.object(
+                etrn,
+                "load_clients_by_inn",
+                new=AsyncMock(side_effect=RuntimeError("auth expired")),
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            await etrn.prepare_audience(inn_file)
+
+        with closing(database.get_connection()) as connection:
+            failed = connection.execute(
+                "SELECT event_type, event_data FROM mail_audience_events "
+                "WHERE campaign_id = ? AND event_type != 'prepare_summary'",
+                (campaign_id,),
+            ).fetchall()
+        self.assertEqual(
+            [(row["event_type"], row["event_data"]) for row in failed],
+            [("sbis_lookup_failed", "RuntimeError")],
+        )
+
+    async def test_prepare_keeps_enrichment_failure_separate_after_fallback(self) -> None:
+        inn = "7725806898"
+        inn_file = self.root / "fallback.txt"
+        inn_file.write_text(f"{inn}\n", encoding="utf-8")
+
+        async def load_client(*args: object, **kwargs: object) -> list[dict[str, str]]:
+            database.upsert_client_by_inn_lookup(
+                inn=inn,
+                spp_uuid="4e450d9b-81b7-4bc4-b71a-a5dfb83116a8",
+            )
+            return [{"inn": inn, "spp_uuid": "4e450d9b-81b7-4bc4-b71a-a5dfb83116a8"}]
+
+        with (
+            patch.object(etrn, "load_clients_by_inn", new=AsyncMock(side_effect=load_client)),
+            patch.object(
+                etrn, "_enrich_client", new=AsyncMock(side_effect=RuntimeError("card failed")),
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            campaign_id, stats = await etrn.prepare_audience(inn_file)
+
+        with closing(database.get_connection()) as connection:
+            reasons = {row["event_type"] for row in connection.execute(
+                "SELECT event_type FROM mail_audience_events WHERE campaign_id = ?",
+                (campaign_id,),
+            ).fetchall()}
+        self.assertEqual(stats.clients_found, 1)
+        self.assertEqual(stats.without_email, 1)
+        self.assertIn("enrichment_failed", reasons)
+        self.assertNotIn("client_not_found", reasons)
+        self.assertNotIn("sbis_lookup_failed", reasons)
 
     def test_family_dedup_spans_separate_etrn_campaigns(self) -> None:
         first_client = self.add_client("2500000030", ["same@example.ru"])

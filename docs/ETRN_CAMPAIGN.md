@@ -45,6 +45,8 @@ python -m src.mailing.etrn send --confirm-real-send
 ```text
 INN list
 → clients по точному ИНН
+→ если клиента нет: штатный Contractor.SearchSuggest по точному ИНН
+→ штатный upsert в clients и запись источника в client_sources
 → client_contacts
 → ContractorCard.Read только при отсутствии email
 → strip + lowercase + базовая валидация
@@ -60,7 +62,7 @@ INN list
 только первый.
 
 Причины пропуска сохраняются в общей таблице `mail_audience_events`:
-`client_not_found`, `no_email`, `enrichment_failed`, `invalid_email`,
+`client_not_found`, `sbis_lookup_failed`, `no_email`, `enrichment_failed`, `invalid_email`,
 `duplicate_etrn`, `bounced`. Таблица является общим журналом подготовки, а не
 параллельным реестром отправленных ЭТрН-писем. Факт отправки остаётся в
 `mail_messages`/`mail_events`.
