@@ -58,8 +58,9 @@ INN list
 `duplicate_etrn`, `bounced`. Таблица является общим журналом подготовки, а не
 параллельным реестром отправленных ЭТрН-писем. Факт отправки остаётся в
 `mail_messages`/`mail_events`.
-Завершённый prepare также создаёт `mail_runs` со счётчиком `recipients_added`,
-поэтому кампания появляется в существующей админке ещё до SMTP-отправки.
+Итоговый snapshot подготовки сохраняется событием `prepare_summary` в этом же
+журнале. `prepare` не создаёт `mail_run` и поэтому не выглядит в админке как
+завершённая почтовая рассылка.
 
 Пример итогов:
 
@@ -90,22 +91,36 @@ Postfix delivery tracking, open/click tracking и админка работаю�
 SMTP 4xx и temporary/deferred считаются временными. SMTP 5xx и остальные
 окончательные ошибки не ретраятся.
 
-Batch считается по SMTP-попыткам email, а не по ИНН. Значение ограничено сверху
-500. После полного batch выбирается случайный cooldown 2400–3000 секунд.
-`batch_sent_count` и `next_send_at` хранятся в `mail_campaigns`; рестарт процесса
-не сбрасывает лимит и не обходит cooldown.
+Worker выбирает из одной очереди кампании только `pending` и созревшие
+`deferred` записи запросом с `ORDER BY mail_recipients.id LIMIT 500`. Для каждой
+выборки атомарно создаётся новый `mail_runs`; выбранное количество сохраняется в
+`recipients_added`, а последовательный номер — в `mail_runs.batch_number`.
+Статусы `sent` и `failed` в следующую выборку не попадают.
+
+После каждого завершённого run при наличии остатка очереди выбирается случайный
+cooldown 2400–3000 секунд. Абсолютное UTC-время продолжения хранится в
+`mail_campaigns.next_send_at`. Worker ждёт до этого времени и создаёт следующий
+run. После рестарта незавершённый run закрывается как `failed`, уже отправленные
+адреса остаются `sent`, а worker выдерживает сохранённый остаток cooldown и
+продолжает оставшуюся очередь. Старое поле `batch_sent_count` больше не участвует
+в ограничении партий.
 
 Логи имеют вид:
 
 ```text
 ETRN_BATCH_START
+batch=1
+run_id=42
 size=500
 [1/500] info@example.ru -> sent
 ETRN_BATCH_COMPLETE
+batch=1
+run_id=42
+recipients=500
 sent=482
 failed=18
 deferred=0
-ETRN_COOLDOWN
+ETRN_COOLDOWN_SET
 duration=2714s
 until=2026-08-31T12:34:56+00:00
 ```

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import random
 import re
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -16,9 +17,8 @@ from src.client_loader import request_with_network_retries
 from src.config import PROJECT_ROOT
 from src.database import (
     complete_mail_message,
-    copy_latest_mail_run_preparation_stats,
+    create_mail_batch_run,
     create_mail_message,
-    create_mail_run,
     finish_mail_run,
     get_connection,
     get_mail_campaign,
@@ -26,6 +26,7 @@ from src.database import (
     save_enriched_client,
     set_mail_run_preparation_stats,
     set_mail_run_pending_count,
+    update_mail_run_counts,
 )
 from src.mailing.sender import MailMessage, build_mail_message
 from src.mailing.smtp_provider import MailAttachment, SMTPMailProvider
@@ -254,7 +255,6 @@ async def prepare_audience(inn_file: Path) -> tuple[int, PrepareStats]:
             stats.unique_emails += 1
             stats.queued += 1
 
-    prepare_run_id = create_mail_run(campaign_id=campaign_id, selection_id=0)
     skipped_count = (
         stats.input_inns
         - stats.clients_found
@@ -263,28 +263,15 @@ async def prepare_audience(inn_file: Path) -> tuple[int, PrepareStats]:
         + stats.duplicate_etrn
         + stats.bounced_before_send
     )
-    set_mail_run_preparation_stats(
-        prepare_run_id,
-        input_inns_count=stats.input_inns,
-        clients_found_count=stats.clients_found,
-        clients_without_email_count=stats.without_email,
-        email_found_after_enrichment_count=stats.email_found_after_enrichment,
-        invalid_email_count=stats.invalid_email,
-        duplicate_count=stats.duplicate_etrn,
-        bounced_before_send_count=stats.bounced_before_send,
-        prepared_email_count=stats.queued,
-        skipped_count=skipped_count,
-        pending_count=stats.queued,
-    )
-    finish_mail_run(
-        prepare_run_id,
-        status="success",
-        recipients_added=stats.queued,
-        sent_count=0,
-        delivered_count=0,
-        bounced_count=0,
-        deferred_count=0,
-        failed_count=0,
+    _audit(
+        campaign_id,
+        "prepare_summary",
+        source_value=str(inn_file),
+        event_data=json.dumps(
+            {**asdict(stats), "skipped_count": skipped_count},
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
     )
     print(f"ETRN_CONTACTS_READY\nclients={stats.clients_found}\nemails={stats.queued}")
     print_prepare_stats(stats)
@@ -371,21 +358,53 @@ def _campaign_cooldown(campaign_id: int) -> datetime | None:
     return value if value > datetime.now(timezone.utc) else None
 
 
-def _batch_sent_count(campaign_id: int) -> int:
-    return int(get_mail_campaign(campaign_id).get("batch_sent_count") or 0)
-
-
-def _increment_batch_count(campaign_id: int) -> None:
+def _pending_queue_count(campaign_id: int) -> int:
     with closing(get_connection()) as connection, connection:
-        connection.execute(
+        return int(connection.execute(
             """
-            UPDATE mail_campaigns
-            SET batch_sent_count = batch_sent_count + 1,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
+            SELECT COUNT(*) FROM mail_recipients
+            WHERE campaign_id = ? AND status IN ('pending', 'deferred')
+            """,
+            (campaign_id,),
+        ).fetchone()[0])
+
+
+def _preparation_snapshot(campaign_id: int) -> dict[str, int]:
+    with closing(get_connection()) as connection:
+        row = connection.execute(
+            """
+            SELECT event_data FROM mail_audience_events
+            WHERE campaign_id = ? AND event_type = 'prepare_summary'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (campaign_id,),
+        ).fetchone()
+    if row is None or not row["event_data"]:
+        return {}
+    try:
+        value = json.loads(str(row["event_data"]))
+    except (TypeError, ValueError):
+        return {}
+    return {
+        str(key): int(count)
+        for key, count in value.items()
+        if isinstance(count, int) and count >= 0
+    }
+
+
+def _recover_interrupted_runs(campaign_id: int) -> int:
+    """Закрыть runs прерванного worker перед созданием новой партии."""
+    with closing(get_connection()) as connection, connection:
+        cursor = connection.execute(
+            """
+            UPDATE mail_runs
+            SET status = 'failed', finished_at = CURRENT_TIMESTAMP,
+                error_text = COALESCE(error_text, 'worker_restarted')
+            WHERE campaign_id = ? AND status = 'running'
             """,
             (campaign_id,),
         )
+        return cursor.rowcount
 
 
 def _defer_recipient(recipient_id: int, attempts: int, error: str, delay: int) -> None:
@@ -418,12 +437,31 @@ def _set_cooldown(campaign_id: int, duration: int) -> datetime:
     with closing(get_connection()) as connection, connection:
         connection.execute(
             """
-            UPDATE mail_campaigns SET next_send_at = ?, batch_sent_count = 0,
+            UPDATE mail_campaigns SET next_send_at = ?,
                 updated_at = CURRENT_TIMESTAMP WHERE id = ?
             """,
             (until.strftime("%Y-%m-%d %H:%M:%S"), campaign_id),
         )
     return until
+
+
+def _clear_cooldown(campaign_id: int) -> None:
+    with closing(get_connection()) as connection, connection:
+        connection.execute(
+            """
+            UPDATE mail_campaigns SET next_send_at = NULL,
+                updated_at = CURRENT_TIMESTAMP WHERE id = ?
+            """,
+            (campaign_id,),
+        )
+
+
+def _cooldown_duration() -> int:
+    minimum = _env_int("ETRN_COOLDOWN_MIN_SECONDS", 2400)
+    maximum = _env_int("ETRN_COOLDOWN_MAX_SECONDS", 3000)
+    if maximum < minimum:
+        raise ValueError("Максимальный ETRN cooldown меньше минимального")
+    return random.randint(minimum, maximum)
 
 
 async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
@@ -435,32 +473,17 @@ async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
     batch_size = min(_env_int("ETRN_BATCH_SIZE", 500), 500)
     if batch_size < 1:
         raise ValueError("ETRN_BATCH_SIZE должен быть больше 0")
-    cooldown = _campaign_cooldown(campaign_id)
-    if cooldown and not dry_run:
-        print(f"ETRN_COOLDOWN\nuntil={cooldown.isoformat()}")
-        return
-    batch_count = _batch_sent_count(campaign_id)
-    if not dry_run and batch_count >= batch_size:
-        cooldown_min = _env_int("ETRN_COOLDOWN_MIN_SECONDS", 2400)
-        cooldown_max = _env_int("ETRN_COOLDOWN_MAX_SECONDS", 3000)
-        if cooldown_max < cooldown_min:
-            raise ValueError("Максимальный ETRN cooldown меньше минимального")
-        duration = random.randint(cooldown_min, cooldown_max)
-        until = _set_cooldown(campaign_id, duration)
-        print(f"ETRN_COOLDOWN\nduration={duration}s\nuntil={until.isoformat()}")
-        return
-    remaining_in_batch = batch_size if dry_run else batch_size - batch_count
-    recipients = _eligible_recipients(
-        campaign_id,
-        remaining_in_batch,
-        promote_deferred=not dry_run,
-    )
-    if not recipients:
-        print("Pending/deferred-получателей ЭТрН, готовых к отправке, нет.")
-        return
     template = get_mail_template(TEMPLATE_NAME)
-    print(f"ETRN_BATCH_START\nsize={len(recipients)}")
     if dry_run:
+        recipients = _eligible_recipients(
+            campaign_id,
+            batch_size,
+            promote_deferred=False,
+        )
+        if not recipients:
+            print("Pending/deferred-получателей ЭТрН, готовых к отправке, нет.")
+            return
+        print(f"ETRN_BATCH_PREVIEW\nsize={len(recipients)}")
         for index, recipient in enumerate(recipients, 1):
             message = build_mail_message(recipient, template)
             message.attachments = attachments
@@ -477,70 +500,145 @@ async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
     jitter_max = _env_int("ETRN_MESSAGE_DELAY_MAX_SECONDS", 8)
     if jitter_max < jitter_min:
         raise ValueError("Максимальный ETRN jitter меньше минимального")
-    run_id = create_mail_run(campaign_id=campaign_id, selection_id=0)
-    copy_latest_mail_run_preparation_stats(
-        campaign_id=campaign_id,
-        target_run_id=run_id,
-    )
-    sent = failed = deferred = 0
-    try:
-        for index, recipient in enumerate(recipients, 1):
-            record = create_mail_message(
-                recipient_id=int(recipient["recipient_id"]), provider="smtp", run_id=run_id,
+    recovered_runs = _recover_interrupted_runs(campaign_id)
+    if recovered_runs and _pending_queue_count(campaign_id) and not _campaign_cooldown(campaign_id):
+        _set_cooldown(campaign_id, _cooldown_duration())
+
+    while True:
+        cooldown = _campaign_cooldown(campaign_id)
+        if cooldown is not None:
+            delay = max(
+                1,
+                int((cooldown - datetime.now(timezone.utc)).total_seconds()) + 1,
             )
-            message: MailMessage = build_mail_message(
-                recipient, template, tracking_token=str(record["tracking_token"]),
-            )
-            message.attachments = attachments
-            result = await provider.send(message)
-            complete_mail_message(
-                message_id=int(record["message_id"]),
-                provider_message_id=result.provider_message_id,
-                success=result.success,
-                error=result.error,
-            )
-            _increment_batch_count(campaign_id)
-            attempts = int(recipient.get("attempt_count") or 0) + 1
-            if result.success:
-                sent += 1
-                _record_attempt(message.recipient_id, attempts)
-                outcome = "sent"
-            else:
-                error = result.error or "SMTP error"
-                if attempts < 3 and TRANSIENT_ERROR_RE.search(error):
-                    deferred += 1
-                    _defer_recipient(message.recipient_id, attempts, error, retry_delays[attempts - 1])
-                    outcome = "deferred"
-                else:
-                    failed += 1
-                    _record_attempt(message.recipient_id, attempts, error)
-                    outcome = "failed"
-            print(f"[{index}/{len(recipients)}] {message.to_email} -> {outcome}")
-            if index < len(recipients):
-                await asyncio.sleep(random.randint(jitter_min, jitter_max))
-    except BaseException as error:
-        finish_mail_run(
-            run_id, status="failed", recipients_added=0, sent_count=sent,
-            delivered_count=0, bounced_count=0, deferred_count=deferred,
-            failed_count=failed, error_text=type(error).__name__,
+            print(f"ETRN_COOLDOWN\nduration={delay}s\nuntil={cooldown.isoformat()}")
+            await asyncio.sleep(delay)
+
+        recipients = _eligible_recipients(campaign_id, batch_size)
+        if not recipients:
+            if _pending_queue_count(campaign_id) == 0:
+                _clear_cooldown(campaign_id)
+            print("Pending/deferred-получателей ЭТрН, готовых к отправке, нет.")
+            return
+
+        run_id, batch_number = create_mail_batch_run(
+            campaign_id=campaign_id,
+            selection_id=0,
         )
-        set_mail_run_pending_count(run_id, campaign_stats()["pending"])
-        raise
-    finish_mail_run(
-        run_id, status="success" if not failed and not deferred else "partial",
-        recipients_added=0, sent_count=sent, delivered_count=0,
-        bounced_count=0, deferred_count=deferred, failed_count=failed,
-    )
-    set_mail_run_pending_count(run_id, campaign_stats()["pending"])
-    print(f"ETRN_BATCH_COMPLETE\nsent={sent}\nfailed={failed}\ndeferred={deferred}")
-    if batch_count + len(recipients) >= batch_size:
-        cooldown_min = _env_int("ETRN_COOLDOWN_MIN_SECONDS", 2400)
-        cooldown_max = _env_int("ETRN_COOLDOWN_MAX_SECONDS", 3000)
-        if cooldown_max < cooldown_min:
-            raise ValueError("Максимальный ETRN cooldown меньше минимального")
-        duration = random.randint(cooldown_min, cooldown_max)
+        snapshot = _preparation_snapshot(campaign_id)
+        set_mail_run_preparation_stats(
+            run_id,
+            input_inns_count=snapshot.get("input_inns", 0),
+            clients_found_count=snapshot.get("clients_found", 0),
+            clients_without_email_count=snapshot.get("without_email", 0),
+            email_found_after_enrichment_count=snapshot.get(
+                "email_found_after_enrichment", 0
+            ),
+            invalid_email_count=snapshot.get("invalid_email", 0),
+            duplicate_count=snapshot.get("duplicate_etrn", 0),
+            bounced_before_send_count=snapshot.get("bounced_before_send", 0),
+            prepared_email_count=len(recipients),
+            skipped_count=snapshot.get("skipped_count", 0),
+            pending_count=_pending_queue_count(campaign_id),
+        )
+        update_mail_run_counts(
+            run_id,
+            recipients_added=len(recipients),
+            sent_count=0,
+            delivered_count=0,
+            bounced_count=0,
+            deferred_count=0,
+            failed_count=0,
+        )
+        print(
+            f"ETRN_BATCH_START\nbatch={batch_number}\n"
+            f"run_id={run_id}\nsize={len(recipients)}"
+        )
+        sent = failed = deferred = 0
+        try:
+            for index, recipient in enumerate(recipients, 1):
+                record = create_mail_message(
+                    recipient_id=int(recipient["recipient_id"]),
+                    provider="smtp",
+                    run_id=run_id,
+                )
+                message: MailMessage = build_mail_message(
+                    recipient,
+                    template,
+                    tracking_token=str(record["tracking_token"]),
+                )
+                message.attachments = attachments
+                result = await provider.send(message)
+                complete_mail_message(
+                    message_id=int(record["message_id"]),
+                    provider_message_id=result.provider_message_id,
+                    success=result.success,
+                    error=result.error,
+                )
+                attempts = int(recipient.get("attempt_count") or 0) + 1
+                if result.success:
+                    sent += 1
+                    _record_attempt(message.recipient_id, attempts)
+                    outcome = "sent"
+                else:
+                    error = result.error or "SMTP error"
+                    if attempts < 3 and TRANSIENT_ERROR_RE.search(error):
+                        deferred += 1
+                        _defer_recipient(
+                            message.recipient_id,
+                            attempts,
+                            error,
+                            retry_delays[attempts - 1],
+                        )
+                        outcome = "deferred"
+                    else:
+                        failed += 1
+                        _record_attempt(message.recipient_id, attempts, error)
+                        outcome = "failed"
+                print(f"[{index}/{len(recipients)}] {message.to_email} -> {outcome}")
+                if index < len(recipients):
+                    await asyncio.sleep(random.randint(jitter_min, jitter_max))
+        except BaseException as error:
+            finish_mail_run(
+                run_id,
+                status="failed",
+                recipients_added=len(recipients),
+                sent_count=sent,
+                delivered_count=0,
+                bounced_count=0,
+                deferred_count=deferred,
+                failed_count=failed,
+                error_text=type(error).__name__,
+            )
+            pending_count = _pending_queue_count(campaign_id)
+            set_mail_run_pending_count(run_id, pending_count)
+            if pending_count:
+                _set_cooldown(campaign_id, _cooldown_duration())
+            raise
+
+        finish_mail_run(
+            run_id,
+            status="success" if not failed and not deferred else "partial",
+            recipients_added=len(recipients),
+            sent_count=sent,
+            delivered_count=0,
+            bounced_count=0,
+            deferred_count=deferred,
+            failed_count=failed,
+        )
+        pending_count = _pending_queue_count(campaign_id)
+        set_mail_run_pending_count(run_id, pending_count)
+        print(
+            f"ETRN_BATCH_COMPLETE\nbatch={batch_number}\nrun_id={run_id}\n"
+            f"recipients={len(recipients)}\nsent={sent}\n"
+            f"failed={failed}\ndeferred={deferred}"
+        )
+        if pending_count == 0:
+            _clear_cooldown(campaign_id)
+            return
+        duration = _cooldown_duration()
         until = _set_cooldown(campaign_id, duration)
-        print(f"ETRN_COOLDOWN\nduration={duration}s\nuntil={until.isoformat()}")
+        print(f"ETRN_COOLDOWN_SET\nduration={duration}s\nuntil={until.isoformat()}")
 
 
 def campaign_stats() -> dict[str, int]:

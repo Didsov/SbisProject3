@@ -201,6 +201,7 @@ class MailMessageQueriesTestCase(unittest.TestCase):
                 "run_id",
                 "run_status",
                 "run_started_at",
+                "batch_number",
                 "campaign_id",
                 "campaign_name",
                 "campaign_family",

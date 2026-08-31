@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import gc
 import io
 import tempfile
@@ -81,33 +82,21 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
                     (campaign_id,),
                 ).fetchall()
             }
-            prepare_run = connection.execute(
-                """
-                SELECT input_inns_count, clients_found_count,
-                       clients_without_email_count, invalid_email_count,
-                       duplicate_count, prepared_email_count,
-                       skipped_count, pending_count
-                FROM mail_runs
-                WHERE campaign_id = ?
-                ORDER BY id DESC LIMIT 1
-                """,
+            run_count = connection.execute(
+                "SELECT COUNT(*) FROM mail_runs WHERE campaign_id = ?",
                 (campaign_id,),
-            ).fetchone()
+            ).fetchone()[0]
         self.assertEqual([row["normalized_email"] for row in rows], ["a@example.ru", "b@example.ru"])
         self.assertTrue({"client_not_found", "no_email", "invalid_email", "duplicate_etrn"} <= reasons)
-        self.assertEqual(
-            dict(prepare_run),
-            {
-                "input_inns_count": 4,
-                "clients_found_count": 3,
-                "clients_without_email_count": 1,
-                "invalid_email_count": 1,
-                "duplicate_count": 1,
-                "prepared_email_count": 2,
-                "skipped_count": 4,
-                "pending_count": 2,
-            },
-        )
+        self.assertEqual(run_count, 0)
+        snapshot = etrn._preparation_snapshot(campaign_id)
+        self.assertEqual(snapshot["input_inns"], 4)
+        self.assertEqual(snapshot["clients_found"], 3)
+        self.assertEqual(snapshot["without_email"], 1)
+        self.assertEqual(snapshot["invalid_email"], 1)
+        self.assertEqual(snapshot["duplicate_etrn"], 1)
+        self.assertEqual(snapshot["queued"], 2)
+        self.assertEqual(snapshot["skipped_count"], 4)
 
     def test_family_dedup_spans_separate_etrn_campaigns(self) -> None:
         first_client = self.add_client("2500000030", ["same@example.ru"])
@@ -158,6 +147,7 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
             "prepared_email_count",
             "skipped_count",
             "pending_count",
+            "batch_number",
         } <= run_columns)
         self.assertEqual(quick_check, "ok")
 
@@ -209,6 +199,42 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
         provider = AsyncMock()
         provider.send.return_value = SMTPSendResult(True, "message-id")
 
+        async def stop_during_cooldown(delay: int) -> None:
+            if delay >= 2400:
+                raise asyncio.CancelledError
+
+        with (
+            patch.object(etrn, "ATTACHMENTS_DIR", attachment_dir),
+            patch.object(etrn.SMTPMailProvider, "from_env", return_value=provider),
+            patch.object(etrn.asyncio, "sleep", side_effect=stop_during_cooldown),
+            patch.dict(
+                "os.environ",
+                {
+                    "ETRN_BATCH_SIZE": "2",
+                    "ETRN_MESSAGE_DELAY_MIN_SECONDS": "0",
+                    "ETRN_MESSAGE_DELAY_MAX_SECONDS": "0",
+                    "ETRN_COOLDOWN_MIN_SECONDS": "2400",
+                    "ETRN_COOLDOWN_MAX_SECONDS": "2400",
+                },
+            ),
+            redirect_stdout(io.StringIO()),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await etrn.send_campaign(dry_run=False, confirm_real_send=True)
+
+        self.assertEqual(provider.send.await_count, 2)
+        with closing(database.get_connection()) as connection:
+            campaign = connection.execute(
+                "SELECT next_send_at FROM mail_campaigns WHERE id = ?",
+                (campaign_id,),
+            ).fetchone()
+            statuses = [row["status"] for row in connection.execute(
+                "SELECT status FROM mail_recipients WHERE campaign_id = ? ORDER BY id",
+                (campaign_id,),
+            ).fetchall()]
+        self.assertIsNotNone(campaign["next_send_at"])
+        self.assertEqual(statuses, ["sent", "sent", "pending"])
+
         with (
             patch.object(etrn, "ATTACHMENTS_DIR", attachment_dir),
             patch.object(etrn.SMTPMailProvider, "from_env", return_value=provider),
@@ -227,19 +253,30 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
         ):
             await etrn.send_campaign(dry_run=False, confirm_real_send=True)
 
-        self.assertEqual(provider.send.await_count, 2)
+        self.assertEqual(provider.send.await_count, 3)
         with closing(database.get_connection()) as connection:
-            campaign = connection.execute(
-                "SELECT next_send_at, batch_sent_count FROM mail_campaigns WHERE id = ?",
+            runs = connection.execute(
+                """
+                SELECT batch_number, recipients_added, status
+                FROM mail_runs WHERE campaign_id = ? ORDER BY batch_number
+                """,
                 (campaign_id,),
-            ).fetchone()
+            ).fetchall()
             statuses = [row["status"] for row in connection.execute(
                 "SELECT status FROM mail_recipients WHERE campaign_id = ? ORDER BY id",
                 (campaign_id,),
             ).fetchall()]
-        self.assertIsNotNone(campaign["next_send_at"])
-        self.assertEqual(campaign["batch_sent_count"], 0)
-        self.assertEqual(statuses, ["sent", "sent", "pending"])
+            next_send_at = connection.execute(
+                "SELECT next_send_at FROM mail_campaigns WHERE id = ?",
+                (campaign_id,),
+            ).fetchone()[0]
+        self.assertEqual(
+            [(row["batch_number"], row["recipients_added"]) for row in runs],
+            [(1, 2), (2, 1)],
+        )
+        self.assertEqual([row["status"] for row in runs], ["success", "success"])
+        self.assertEqual(statuses, ["sent", "sent", "sent"])
+        self.assertIsNone(next_send_at)
 
     async def test_temporary_smtp_error_is_deferred_for_retry(self) -> None:
         client_id = self.add_client("2500000020", ["retry@example.ru"])
@@ -255,6 +292,7 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(etrn, "ATTACHMENTS_DIR", attachment_dir),
             patch.object(etrn.SMTPMailProvider, "from_env", return_value=provider),
+            patch.object(etrn.asyncio, "sleep", new=AsyncMock()),
             patch.dict(
                 "os.environ",
                 {
@@ -279,6 +317,30 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recipient["attempt_count"], 1)
         self.assertIsNotNone(recipient["next_attempt_at"])
         self.assertEqual(message_status, "failed")
+
+    def test_restart_closes_interrupted_batch_before_next_number(self) -> None:
+        campaign_id = etrn.ensure_etrn_campaign()
+        first_run_id, first_batch = database.create_mail_batch_run(
+            campaign_id=campaign_id,
+            selection_id=0,
+        )
+
+        self.assertEqual(etrn._recover_interrupted_runs(campaign_id), 1)
+        second_run_id, second_batch = database.create_mail_batch_run(
+            campaign_id=campaign_id,
+            selection_id=0,
+        )
+
+        with closing(database.get_connection()) as connection:
+            first_run = connection.execute(
+                "SELECT status, error_text FROM mail_runs WHERE id = ?",
+                (first_run_id,),
+            ).fetchone()
+        self.assertEqual(first_batch, 1)
+        self.assertEqual(second_batch, 2)
+        self.assertNotEqual(first_run_id, second_run_id)
+        self.assertEqual(first_run["status"], "failed")
+        self.assertEqual(first_run["error_text"], "worker_restarted")
 
     def test_template_uses_safe_personalization_and_tracking(self) -> None:
         generic = etrn_template.build_text_body(

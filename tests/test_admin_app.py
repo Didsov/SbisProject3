@@ -13,6 +13,7 @@ RUN = {
     "campaign_id": 3,
     "campaign_name": "Campaign <unsafe>",
     "campaign_family": "new_companies",
+    "batch_number": None,
     "selection_id": 5984,
     "trigger": "manual",
     "status": "partial",
@@ -83,6 +84,7 @@ MESSAGE_DETAILS = {
     "campaign_family": "new_companies",
     "run_status": "partial",
     "run_started_at": "2026-08-20 09:00:00",
+    "batch_number": None,
     "client_id": 11,
     "company_name": "Company <One>",
     "inn": "9900000001",
@@ -340,6 +342,7 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
             **DETAILS,
             "campaign_name": "etrn_2026_08",
             "campaign_family": "etrn",
+            "batch_number": 3,
             "input_inns_count": 12,
             "clients_found_count": 10,
             "clients_without_email_count": 2,
@@ -368,9 +371,26 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertIn(label, page_html)
         self.assertIn("etrn_2026_08", page_html)
-        self.assertIn("Email подготовлено", page_html)
+        self.assertIn("Получатели", page_html)
+        self.assertIn("Batch", page_html)
         self.assertIn("Уник. открытия", page_html)
         self.assertIn("Уник. клики", page_html)
+
+    async def test_runs_list_shows_separate_etrn_batches(self) -> None:
+        self.get_recent.return_value = [
+            {**RUN, "run_id": 12, "campaign_family": "etrn", "batch_number": 2},
+            {**RUN, "run_id": 11, "campaign_family": "etrn", "batch_number": 1},
+        ]
+
+        response = await self.client.get("/admin/runs")
+        page_html = await response.text()
+
+        self.assertEqual(response.status, 200)
+        self.assertIn('href="/admin/runs/12"', page_html)
+        self.assertIn('href="/admin/runs/11"', page_html)
+        self.assertIn('data-label="Batch"', page_html)
+        self.assertIn('>2</a>', page_html)
+        self.assertIn('>1</a>', page_html)
 
     async def test_message_details_contains_timeline_and_channel(
         self,

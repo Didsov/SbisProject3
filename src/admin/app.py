@@ -469,6 +469,7 @@ async def handle_admin(request: web.Request) -> web.Response:
                 ),
                 ("Кампания", _value(latest_run["campaign_name"])),
                 ("Семейство", _value(latest_run["campaign_family"])),
+                ("Batch", _value(latest_run["batch_number"])),
                 ("Selection", _value(latest_run["selection_id"])),
             )
         )
@@ -531,6 +532,7 @@ async def handle_admin(request: web.Request) -> web.Response:
                 ("Длительность", escape(mailing_duration)),
                 ("Кампания", _value(latest_mailing["campaign_name"])),
                 ("Семейство", _value(latest_mailing["campaign_family"])),
+                ("Batch", _value(latest_mailing["batch_number"])),
                 ("Selection", _value(latest_mailing["selection_id"])),
             )
         )
@@ -547,6 +549,7 @@ async def handle_runs(request: web.Request) -> web.Response:
     table = _table(
         headers=(
             "Запуск",
+            "Batch",
             "Семейство",
             "Кампания",
             "Начало",
@@ -566,6 +569,7 @@ async def handle_runs(request: web.Request) -> web.Response:
             (
                 (
                     f'<strong class="numeric">#{_value(run["run_id"])}</strong>',
+                    _value(run["batch_number"]),
                     _value(run["campaign_family"]),
                     _value(run["campaign_name"]),
                     _value(run["started_at"]),
@@ -728,7 +732,7 @@ async def handle_run_details(request: web.Request) -> web.Response:
         + _metrics(
             (
                 ("ИНН обработано", details["input_inns_count"]),
-                ("Email подготовлено", details["prepared_email_count"]),
+                ("Получатели", details["recipients_added"]),
                 ("Skipped", details["skipped_count"]),
                 ("Pending", details["pending_count"]),
                 ("Отправлено", details["sent_count"]),
@@ -747,6 +751,7 @@ async def handle_run_details(request: web.Request) -> web.Response:
                 ("Статус", _display_run_status(details)),
                 ("Кампания", _value(details["campaign_name"])),
                 ("Семейство", _value(details["campaign_family"])),
+                ("Batch", _value(details["batch_number"])),
                 ("Run ID", _value(details["run_id"])),
                 ("Selection", _value(details["selection_id"])),
                 ("Начало", _value(details["started_at"])),
@@ -822,6 +827,7 @@ async def handle_message_details(
             ("Кампания", _value(details["campaign_name"])),
             ("Семейство", _value(details["campaign_family"])),
             ("Run ID", _value(details["run_id"])),
+            ("Batch", _value(details["batch_number"])),
             ("Статус запуска", _display_run_status({"status": details["run_status"]})),
             ("Запуск начат", _value(details["run_started_at"])),
             ("Message ID", _value(details["message_id"])),

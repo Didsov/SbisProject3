@@ -1198,6 +1198,7 @@ def initialize_mailing_tables(
             bounced_count INTEGER NOT NULL DEFAULT 0,
             deferred_count INTEGER NOT NULL DEFAULT 0,
             failed_count INTEGER NOT NULL DEFAULT 0,
+            batch_number INTEGER,
 
             input_inns_count INTEGER NOT NULL DEFAULT 0,
             clients_found_count INTEGER NOT NULL DEFAULT 0,
@@ -1226,6 +1227,7 @@ def initialize_mailing_tables(
         ).fetchall()
     }
     for column_name in (
+        "batch_number",
         "input_inns_count",
         "clients_found_count",
         "clients_without_email_count",
@@ -1238,9 +1240,13 @@ def initialize_mailing_tables(
         "pending_count",
     ):
         if column_name not in run_columns:
+            definition = (
+                "INTEGER"
+                if column_name == "batch_number"
+                else "INTEGER NOT NULL DEFAULT 0"
+            )
             connection.execute(
-                f"ALTER TABLE mail_runs ADD COLUMN {column_name} "
-                "INTEGER NOT NULL DEFAULT 0"
+                f"ALTER TABLE mail_runs ADD COLUMN {column_name} {definition}"
             )
 
     # До разделения статусов Postfix заменял SMTP-статус
@@ -1324,6 +1330,15 @@ def initialize_mailing_tables(
         CREATE INDEX IF NOT EXISTS
             idx_mail_runs_status
         ON mail_runs(status)
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS
+            idx_mail_runs_campaign_batch_number
+        ON mail_runs(campaign_id, batch_number)
+        WHERE batch_number IS NOT NULL
         """
     )
 
@@ -2293,6 +2308,52 @@ def create_mail_run(
         return int(run_id)
 
 
+def create_mail_batch_run(
+    *,
+    campaign_id: int,
+    selection_id: int,
+) -> tuple[int, int]:
+    """Атомарно создать следующий нумерованный batch-run кампании."""
+    if campaign_id < 1:
+        raise ValueError("campaign_id должен быть больше 0")
+    if selection_id < 0:
+        raise ValueError("selection_id не может быть меньше 0")
+
+    with get_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        campaign = connection.execute(
+            "SELECT selection_id FROM mail_campaigns WHERE id = ?",
+            (campaign_id,),
+        ).fetchone()
+        if campaign is None:
+            raise LookupError(f"Кампания с id={campaign_id} не найдена")
+        if campaign["selection_id"] != selection_id:
+            raise ValueError(
+                f"Кампания #{campaign_id} относится к выборке "
+                f"#{campaign['selection_id']}, а не #{selection_id}"
+            )
+
+        batch_number = int(connection.execute(
+            """
+            SELECT COALESCE(MAX(batch_number), 0) + 1
+            FROM mail_runs
+            WHERE campaign_id = ?
+            """,
+            (campaign_id,),
+        ).fetchone()[0])
+        cursor = connection.execute(
+            """
+            INSERT INTO mail_runs (
+                campaign_id, selection_id, trigger, status, batch_number
+            ) VALUES (?, ?, 'manual', 'running', ?)
+            """,
+            (campaign_id, selection_id, batch_number),
+        )
+        if cursor.lastrowid is None:
+            raise RuntimeError("Не удалось получить id batch mail_run")
+        return int(cursor.lastrowid), batch_number
+
+
 def _validate_mail_run_counts(
     counts: dict[str, int],
 ) -> None:
@@ -2355,58 +2416,6 @@ def set_mail_run_preparation_stats(
         )
         if cursor.rowcount != 1:
             raise ValueError(f"mail_runs #{run_id} не найден")
-
-
-def copy_latest_mail_run_preparation_stats(
-    *,
-    campaign_id: int,
-    target_run_id: int,
-) -> None:
-    """Скопировать последний prepare snapshot в новый send-run кампании."""
-    with get_connection() as connection:
-        connection.execute(
-            """
-            UPDATE mail_runs AS target
-            SET (
-                input_inns_count,
-                clients_found_count,
-                clients_without_email_count,
-                email_found_after_enrichment_count,
-                invalid_email_count,
-                duplicate_count,
-                bounced_before_send_count,
-                prepared_email_count,
-                skipped_count,
-                pending_count
-            ) = (
-                SELECT
-                    source.input_inns_count,
-                    source.clients_found_count,
-                    source.clients_without_email_count,
-                    source.email_found_after_enrichment_count,
-                    source.invalid_email_count,
-                    source.duplicate_count,
-                    source.bounced_before_send_count,
-                    source.prepared_email_count,
-                    source.skipped_count,
-                    source.pending_count
-                FROM mail_runs AS source
-                WHERE source.campaign_id = ?
-                  AND source.input_inns_count > 0
-                  AND source.id <> ?
-                ORDER BY source.id DESC
-                LIMIT 1
-            )
-            WHERE target.id = ?
-              AND EXISTS (
-                  SELECT 1 FROM mail_runs AS source
-                  WHERE source.campaign_id = ?
-                    AND source.input_inns_count > 0
-                    AND source.id <> ?
-              )
-            """,
-            (campaign_id, target_run_id, target_run_id, campaign_id, target_run_id),
-        )
 
 
 def set_mail_run_pending_count(run_id: int, pending_count: int) -> None:
@@ -2656,17 +2665,28 @@ def get_recent_mail_runs(
                 mr.campaign_id,
                 mc.name AS campaign_name,
                 mc.campaign_family,
+                mr.batch_number,
                 mr.selection_id,
                 mr.trigger,
                 mr.status,
                 mr.started_at,
                 mr.finished_at,
                 mr.recipients_added,
-                mr.sent_count,
-                mr.delivered_count,
-                mr.bounced_count,
-                mr.deferred_count,
-                mr.failed_count,
+                (SELECT COUNT(*) FROM mail_messages AS message
+                 WHERE message.run_id = mr.id AND message.is_test = 0
+                   AND message.status = 'sent') AS sent_count,
+                (SELECT COUNT(*) FROM mail_messages AS message
+                 WHERE message.run_id = mr.id AND message.is_test = 0
+                   AND message.delivery_status = 'delivered') AS delivered_count,
+                (SELECT COUNT(*) FROM mail_messages AS message
+                 WHERE message.run_id = mr.id AND message.is_test = 0
+                   AND message.delivery_status = 'bounced') AS bounced_count,
+                (SELECT COUNT(*) FROM mail_messages AS message
+                 WHERE message.run_id = mr.id AND message.is_test = 0
+                   AND message.delivery_status = 'deferred') AS deferred_count,
+                (SELECT COUNT(*) FROM mail_messages AS message
+                 WHERE message.run_id = mr.id AND message.is_test = 0
+                   AND message.status = 'failed') AS failed_count,
                 mr.input_inns_count,
                 mr.clients_found_count,
                 mr.clients_without_email_count,
@@ -2705,6 +2725,14 @@ def get_recent_mail_runs(
 
             INNER JOIN mail_campaigns AS mc
                 ON mc.id = mr.campaign_id
+
+            WHERE
+                mc.campaign_family <> 'etrn'
+                OR mr.batch_number IS NOT NULL
+                OR EXISTS (
+                    SELECT 1 FROM mail_messages AS legacy_message
+                    WHERE legacy_message.run_id = mr.id
+                )
 
             ORDER BY
                 mr.started_at DESC,
@@ -2732,17 +2760,28 @@ def get_latest_mail_run_with_sent_messages(
                 mr.campaign_id,
                 mc.name AS campaign_name,
                 mc.campaign_family,
+                mr.batch_number,
                 mr.selection_id,
                 mr.trigger,
                 mr.status,
                 mr.started_at,
                 mr.finished_at,
                 mr.recipients_added,
-                mr.sent_count,
-                mr.delivered_count,
-                mr.bounced_count,
-                mr.deferred_count,
-                mr.failed_count,
+                (SELECT COUNT(*) FROM mail_messages AS message
+                 WHERE message.run_id = mr.id AND message.is_test = 0
+                   AND message.status = 'sent') AS sent_count,
+                (SELECT COUNT(*) FROM mail_messages AS message
+                 WHERE message.run_id = mr.id AND message.is_test = 0
+                   AND message.delivery_status = 'delivered') AS delivered_count,
+                (SELECT COUNT(*) FROM mail_messages AS message
+                 WHERE message.run_id = mr.id AND message.is_test = 0
+                   AND message.delivery_status = 'bounced') AS bounced_count,
+                (SELECT COUNT(*) FROM mail_messages AS message
+                 WHERE message.run_id = mr.id AND message.is_test = 0
+                   AND message.delivery_status = 'deferred') AS deferred_count,
+                (SELECT COUNT(*) FROM mail_messages AS message
+                 WHERE message.run_id = mr.id AND message.is_test = 0
+                   AND message.status = 'failed') AS failed_count,
                 mr.input_inns_count,
                 mr.clients_found_count,
                 mr.clients_without_email_count,
@@ -2782,7 +2821,12 @@ def get_latest_mail_run_with_sent_messages(
             INNER JOIN mail_campaigns AS mc
                 ON mc.id = mr.campaign_id
 
-            WHERE mr.sent_count > 0
+            WHERE EXISTS (
+                SELECT 1 FROM mail_messages AS sent_message
+                WHERE sent_message.run_id = mr.id
+                  AND sent_message.is_test = 0
+                  AND sent_message.status = 'sent'
+            )
 
             ORDER BY
                 mr.started_at DESC,
@@ -2815,17 +2859,28 @@ def get_mail_run_details(
                 mr.campaign_id,
                 mc.name AS campaign_name,
                 mc.campaign_family,
+                mr.batch_number,
                 mr.selection_id,
                 mr.trigger,
                 mr.status,
                 mr.started_at,
                 mr.finished_at,
                 mr.recipients_added,
-                mr.sent_count,
-                mr.delivered_count,
-                mr.bounced_count,
-                mr.deferred_count,
-                mr.failed_count,
+                (SELECT COUNT(*) FROM mail_messages AS message
+                 WHERE message.run_id = mr.id AND message.is_test = 0
+                   AND message.status = 'sent') AS sent_count,
+                (SELECT COUNT(*) FROM mail_messages AS message
+                 WHERE message.run_id = mr.id AND message.is_test = 0
+                   AND message.delivery_status = 'delivered') AS delivered_count,
+                (SELECT COUNT(*) FROM mail_messages AS message
+                 WHERE message.run_id = mr.id AND message.is_test = 0
+                   AND message.delivery_status = 'bounced') AS bounced_count,
+                (SELECT COUNT(*) FROM mail_messages AS message
+                 WHERE message.run_id = mr.id AND message.is_test = 0
+                   AND message.delivery_status = 'deferred') AS deferred_count,
+                (SELECT COUNT(*) FROM mail_messages AS message
+                 WHERE message.run_id = mr.id AND message.is_test = 0
+                   AND message.status = 'failed') AS failed_count,
                 mr.input_inns_count,
                 mr.clients_found_count,
                 mr.clients_without_email_count,
@@ -3036,6 +3091,7 @@ def get_mail_message_details(
                 mm.run_id,
                 run.status AS run_status,
                 run.started_at AS run_started_at,
+                run.batch_number,
                 mr.campaign_id,
                 mc.name AS campaign_name,
                 mc.campaign_family,
@@ -3091,6 +3147,7 @@ def get_mail_message_details(
                 mm.run_id,
                 run.status,
                 run.started_at,
+                run.batch_number,
                 mr.campaign_id,
                 mc.name,
                 mc.campaign_family,
