@@ -21,7 +21,7 @@ PREHEADER = (
     "Подключение ЭТрН, МЧД, ГосКлюч, интеграция с 1С/SAP/Saby "
     "и обучение сотрудников."
 )
-SUBJECT = "С 1 сентября 2026 года ЭТрН станет обязательной — подготовим подключение заранее"
+SUBJECT = "ЭТрН уже обязательна — подключим, настроим и обучим сотрудников"
 _NAME_RE = re.compile(r"^[А-ЯЁ][а-яё-]{1,39}$")
 
 
@@ -157,7 +157,7 @@ def build_html_body(
         <tr><td style="padding:30px"><img src="cid:atlantis-logo" width="270" alt="Атлантис" style="max-width:100%;height:auto"></td></tr>
         <tr><td style="padding:0 30px 30px">
         <p style="font-size:20px;margin:0 0 18px">{greeting}</p>
-        <h1 style="font-size:27px;line-height:1.25;margin:0 0 18px;color:#e76a2e">С 1 сентября 2026 года ЭТрН станет обязательной</h1>
+        <h1 style="font-size:27px;line-height:1.25;margin:0 0 18px;color:#e76a2e">С 1 сентября 2026 года ЭТрН стало обязательным</h1>
         <p style="line-height:1.55">Участникам перевозок необходимо перейти на электронные транспортные накладные. Подготовиться важно заранее — компания может выступать перевозчиком, грузоотправителем или грузополучателем.</p>
         <h2 style="font-size:17px;margin-top:26px">КАК РАБОТАЕТ ЭТрН</h2><table role="presentation" width="100%">{steps_html}</table>
         <h2 style="font-size:17px;margin-top:26px">ЧТО МЫ БЕРЁМ НА СЕБЯ</h2><table role="presentation" width="100%">{benefits}</table>
