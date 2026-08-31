@@ -64,12 +64,17 @@ h2 { margin: 32px 0 14px; color: #273142; font-size: 20px; }
     background: #fff; box-shadow: 0 8px 26px rgba(26, 39, 66, .055);
 }
 .metrics { display: grid; grid-template-columns: repeat(6, minmax(130px, 1fr)); gap: 12px; }
+.run-metrics { display: grid; grid-template-columns: repeat(4, minmax(130px, 1fr)) minmax(180px, 1.25fr); gap: 12px; }
 .metric {
     min-width: 0; padding: 16px; border: 1px solid #e4e9f1; border-radius: 12px;
     background: linear-gradient(145deg, #fff 0%, #f9fbfd 100%);
 }
 .metric-label { min-height: 34px; margin-bottom: 8px; color: #667085; font-size: 12px; line-height: 1.35; }
 .metric-value { color: #172033; font-size: clamp(22px, 3vw, 28px); font-weight: 760; overflow-wrap: anywhere; }
+.delivery-metric { padding: 16px; border: 1px solid #e4e9f1; border-radius: 12px; background: linear-gradient(145deg, #fff 0%, #f9fbfd 100%); }
+.delivery-title { margin-bottom: 8px; color: #344054; font-size: 13px; font-weight: 750; }
+.delivery-row { display: flex; justify-content: space-between; gap: 16px; padding: 3px 0; color: #667085; font-size: 12px; }
+.delivery-row strong { color: #273142; font-variant-numeric: tabular-nums; }
 .run-card { margin-top: 16px; }
 .run-card-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
 .run-card-title { margin: 0; color: #344054; font-size: 15px; font-weight: 730; }
@@ -108,6 +113,7 @@ tbody tr:hover { background: #f8fbff; }
 .empty { padding: 40px 24px; text-align: center; color: #667085; }
 @media (max-width: 1100px) {
     .metrics { grid-template-columns: repeat(3, 1fr); }
+    .run-metrics { grid-template-columns: repeat(3, 1fr); }
     .details-grid { grid-template-columns: repeat(3, 1fr); }
 }
 @media (max-width: 720px) {
@@ -116,6 +122,7 @@ tbody tr:hover { background: #f8fbff; }
     .nav { width: 100%; }
     .nav a { flex: 1; text-align: center; }
     .metrics { grid-template-columns: repeat(2, 1fr); }
+    .run-metrics { grid-template-columns: repeat(2, 1fr); }
     .details-grid { grid-template-columns: repeat(2, 1fr); }
     .run-card-header { align-items: flex-start; flex-direction: column; }
     .panel { padding: 16px; }
@@ -131,6 +138,7 @@ tbody tr:hover { background: #f8fbff; }
 }
 @media (max-width: 420px) {
     .metrics { grid-template-columns: 1fr; }
+    .run-metrics { grid-template-columns: 1fr; }
     .details-grid { grid-template-columns: 1fr 1fr; gap: 15px; }
     td { grid-template-columns: 100px minmax(0, 1fr); }
 }
@@ -380,6 +388,38 @@ def _metrics(items: Iterable[tuple[str, object]]) -> str:
     return f'<div class="metrics">{cards}</div>'
 
 
+def _run_metrics(details: Mapping[str, object]) -> str:
+    """Собрать основные run-метрики и компактную техническую доставку."""
+    cards = "".join(
+        '<div class="metric">'
+        f'<div class="metric-label">{escape(label)}</div>'
+        f'<div class="metric-value numeric">{_value(value)}</div>'
+        "</div>"
+        for label, value in (
+            ("Получатели", details["recipients_added"]),
+            ("Отправлено", details["sent_count"]),
+            ("Открытия", details["unique_open_count"]),
+            ("Клики", details["unique_click_count"]),
+        )
+    )
+    delivery = "".join(
+        '<div class="delivery-row">'
+        f'<span>{escape(label)}</span><strong>{_value(value)}</strong>'
+        "</div>"
+        for label, value in (
+            ("Принято сервером", details["delivered_count"]),
+            ("Bounce", details["bounced_count"]),
+            ("Deferred", details["deferred_count"]),
+            ("Ошибки SMTP", details["failed_count"]),
+        )
+    )
+    return (
+        f'<div class="run-metrics">{cards}'
+        f'<div class="delivery-metric"><div class="delivery-title">Доставка</div>'
+        f'{delivery}</div></div>'
+    )
+
+
 def _details(items: Iterable[tuple[str, str]]) -> str:
     """Собрать карточку с атрибутами запуска."""
     values = "".join(
@@ -559,16 +599,11 @@ async def handle_runs(request: web.Request) -> web.Response:
             "Семейство",
             "Кампания",
             "Начало",
-            "ИНН",
-            "Подготовлено",
-            "Skipped",
-            "Pending",
+            "Длительность",
+            "Получатели",
             "Отправлено",
-            "Принято сервером",
-            "Bounce",
-            "Ошибки",
-            "Открытия / уник.",
-            "Клики / уник.",
+            "Открытия",
+            "Клики",
             "Статус",
         ),
         rows=(
@@ -579,16 +614,11 @@ async def handle_runs(request: web.Request) -> web.Response:
                     _value(run["campaign_family"]),
                     _value(run["campaign_name"]),
                     _value(run["started_at"]),
-                    _value(run["input_inns_count"]),
-                    _value(run["prepared_email_count"]),
-                    _value(run["skipped_count"]),
-                    _value(run["pending_count"]),
+                    escape(_duration(run["started_at"], run["finished_at"])),
+                    _value(run["recipients_added"]),
                     _value(run["sent_count"]),
-                    _value(run["delivered_count"]),
-                    _value(run["bounced_count"]),
-                    _value(run["failed_count"]),
-                    f'{_value(run["open_count"])} / {_value(run["unique_open_count"])}',
-                    f'{_value(run["click_count"])} / {_value(run["unique_click_count"])}',
+                    _value(run["unique_open_count"]),
+                    _value(run["unique_click_count"]),
                     _display_run_status(run),
                 ),
                 f'/admin/runs/{int(run["run_id"])}',
@@ -742,22 +772,7 @@ async def handle_run_details(request: web.Request) -> web.Response:
         '<div class="page-heading"><div class="eyebrow">История рассылок</div>'
         f'<h1>Запуск #{run_id}</h1>'
         '<p class="subtitle">Результаты отправки, реакции получателей и журнал событий.</p></div>'
-        + _metrics(
-            (
-                ("ИНН обработано", details["input_inns_count"]),
-                ("Получатели", details["recipients_added"]),
-                ("Skipped", details["skipped_count"]),
-                ("Pending", details["pending_count"]),
-                ("Отправлено", details["sent_count"]),
-                ("Failed", details["failed_count"]),
-                ("Delivered", details["delivered_count"]),
-                ("Bounce", details["bounced_count"]),
-                ("Открытия", details["open_count"]),
-                ("Уник. открытия", details["unique_open_count"]),
-                ("Клики", details["click_count"]),
-                ("Уник. клики", details["unique_click_count"]),
-            )
-        )
+        + _run_metrics(details)
         + '<section class="panel run-card">'
         + _details(
             (

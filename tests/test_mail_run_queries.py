@@ -213,10 +213,16 @@ class MailRunQueriesTestCase(unittest.TestCase):
                 ("delivered", "2026-08-19 09:02:00", None),
                 ("opened", "2026-08-19 09:03:00", None),
                 ("opened", "2026-08-19 09:04:00", None),
+                ("opened", "2026-08-19 09:04:30", None),
                 (
                     "clicked",
                     "2026-08-19 09:05:00",
                     '{"click_key":"whatsapp"}',
+                ),
+                (
+                    "clicked",
+                    "2026-08-19 09:06:00",
+                    '{"click_key":"telegram"}',
                 ),
             ):
                 connection.execute(
@@ -259,6 +265,17 @@ class MailRunQueriesTestCase(unittest.TestCase):
                 """,
                 (self.message_b_sent,),
             )
+            for event_type, event_at in (
+                ("opened", "2026-08-20 09:04:00"),
+                ("clicked", "2026-08-20 09:05:00"),
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO mail_events (message_id, event_type, event_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (self.message_b_sent, event_type, event_at),
+                )
 
             connection.commit()
 
@@ -352,6 +369,11 @@ class MailRunQueriesTestCase(unittest.TestCase):
         self.assertEqual(runs[0]["bounced_count"], 0)
         self.assertEqual(runs[0]["deferred_count"], 0)
         self.assertEqual(runs[0]["failed_count"], 0)
+        self.assertEqual(runs[0]["unique_open_count"], 0)
+        self.assertEqual(runs[0]["unique_click_count"], 0)
+        empty_details = database.get_mail_run_details(self.run_empty)
+        self.assertEqual(empty_details["unique_open_count"], 0)
+        self.assertEqual(empty_details["unique_click_count"], 0)
 
         with self.assertRaises(ValueError):
             database.get_recent_mail_runs(limit=0)
@@ -423,10 +445,40 @@ class MailRunQueriesTestCase(unittest.TestCase):
     def test_run_engagement_aggregates_exclude_test_messages(self) -> None:
         details = database.get_mail_run_details(self.run_a)
 
-        self.assertEqual(details["open_count"], 2)
+        self.assertEqual(details["open_count"], 3)
         self.assertEqual(details["unique_open_count"], 1)
-        self.assertEqual(details["click_count"], 1)
+        self.assertEqual(details["click_count"], 2)
         self.assertEqual(details["unique_click_count"], 1)
+
+    def test_run_engagement_counts_distinct_messages_and_isolates_runs(self) -> None:
+        with closing(database.get_connection()) as connection:
+            recipient_id = int(connection.execute(
+                "SELECT id FROM mail_recipients ORDER BY id LIMIT 1 OFFSET 1"
+            ).fetchone()["id"])
+            second_message = self._insert_message(
+                connection,
+                recipient_id=recipient_id,
+                run_id=self.run_a,
+                is_test=0,
+                status="sent",
+                delivery_status="delivered",
+                sent_at="2026-08-19 09:07:00",
+            )
+            connection.execute(
+                """
+                INSERT INTO mail_events (message_id, event_type, event_at)
+                VALUES (?, 'opened', '2026-08-19 09:08:00')
+                """,
+                (second_message,),
+            )
+            connection.commit()
+
+        run_a = database.get_mail_run_details(self.run_a)
+        run_b = database.get_mail_run_details(self.run_b)
+        self.assertEqual(run_a["unique_open_count"], 2)
+        self.assertEqual(run_a["unique_click_count"], 1)
+        self.assertEqual(run_b["unique_open_count"], 1)
+        self.assertEqual(run_b["unique_click_count"], 1)
 
     def test_get_mail_run_messages_excludes_test_by_default(self) -> None:
         messages = database.get_mail_run_messages(self.run_a)
@@ -459,11 +511,11 @@ class MailRunQueriesTestCase(unittest.TestCase):
         self.assertEqual(messages[0]["send_status"], "sent")
         self.assertEqual(messages[0]["delivery_status"], "delivered")
         self.assertEqual(messages[0]["delivered_at"], "2026-08-19 09:02:00")
-        self.assertEqual(messages[0]["opened_count"], 2)
-        self.assertEqual(messages[0]["clicked_count"], 1)
+        self.assertEqual(messages[0]["opened_count"], 3)
+        self.assertEqual(messages[0]["clicked_count"], 2)
         self.assertEqual(
             messages[0]["last_event_at"],
-            "2026-08-19 09:05:00",
+            "2026-08-19 09:06:00",
         )
 
         messages_with_test = database.get_mail_run_messages(
@@ -482,7 +534,7 @@ class MailRunQueriesTestCase(unittest.TestCase):
     def test_get_mail_run_events_excludes_test_by_default(self) -> None:
         events = database.get_mail_run_events(self.run_a)
 
-        self.assertEqual(len(events), 5)
+        self.assertEqual(len(events), 7)
         self.assertEqual(
             set(events[0]),
             {
@@ -497,7 +549,10 @@ class MailRunQueriesTestCase(unittest.TestCase):
         )
         self.assertEqual(
             [row["event_type"] for row in events],
-            ["sent", "delivered", "opened", "opened", "clicked"],
+            [
+                "sent", "delivered", "opened", "opened", "opened",
+                "clicked", "clicked",
+            ],
         )
         self.assertTrue(
             all(row["message_id"] == self.message_a for row in events)
@@ -509,14 +564,14 @@ class MailRunQueriesTestCase(unittest.TestCase):
         )
         self.assertEqual(
             events[-1]["event_data"],
-            '{"click_key":"whatsapp"}',
+            '{"click_key":"telegram"}',
         )
 
         events_with_test = database.get_mail_run_events(
             self.run_a,
             include_test=True,
         )
-        self.assertEqual(len(events_with_test), 6)
+        self.assertEqual(len(events_with_test), 8)
         self.assertEqual(
             {row["message_id"] for row in events_with_test},
             {self.message_a, self.test_message_a},

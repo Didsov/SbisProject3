@@ -53,6 +53,10 @@ EMPTY_RUN = {
     "bounced_count": 0,
     "deferred_count": 0,
     "failed_count": 0,
+    "open_count": 0,
+    "unique_open_count": 0,
+    "click_count": 0,
+    "unique_click_count": 0,
 }
 
 DETAILS = {
@@ -277,17 +281,15 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("История запусков", runs_html)
         for label in (
             "Запуск",
+            "Batch",
+            "Семейство",
             "Кампания",
             "Начало",
-            "ИНН",
-            "Подготовлено",
-            "Skipped",
-            "Pending",
+            "Длительность",
+            "Получатели",
             "Отправлено",
-            "Принято сервером",
-            "Ошибки",
-            "Открытия / уник.",
-            "Клики / уник.",
+            "Открытия",
+            "Клики",
             "Статус",
         ):
             self.assertIn(label, runs_html)
@@ -299,6 +301,16 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn('@media (max-width: 720px)', runs_html)
         self.assertIn('data-label="Кампания"', runs_html)
+        self.assertIn(
+            'data-label="Открытия"><a class="row-cell-link" '
+            'href="/admin/runs/8">0</a>',
+            runs_html,
+        )
+        self.assertIn(
+            'data-label="Клики"><a class="row-cell-link" '
+            'href="/admin/runs/8">0</a>',
+            runs_html,
+        )
         self.assertIn("Campaign &lt;unsafe&gt;", runs_html)
         self.assertNotIn("Campaign <unsafe>", runs_html)
         self.assertEqual(
@@ -323,7 +335,18 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Открытия", page_html)
         self.assertIn("Клики", page_html)
         self.assertIn("✓ Принято", page_html)
-        self.assertIn("Failed", page_html)
+        self.assertIn("Доставка", page_html)
+        self.assertIn("Ошибки SMTP", page_html)
+        self.assertIn(
+            '<div class="metric-label">Открытия</div>'
+            '<div class="metric-value numeric">1</div>',
+            page_html,
+        )
+        self.assertIn(
+            '<div class="metric-label">Клики</div>'
+            '<div class="metric-value numeric">1</div>',
+            page_html,
+        )
         self.assertIn("Последние события", page_html)
         self.assertIn("Клик", page_html)
         self.assertIn(
@@ -377,8 +400,8 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("etrn_2026_08", page_html)
         self.assertIn("Получатели", page_html)
         self.assertIn("Batch", page_html)
-        self.assertIn("Уник. открытия", page_html)
-        self.assertIn("Уник. клики", page_html)
+        self.assertIn("Открытия", page_html)
+        self.assertIn("Клики", page_html)
 
     async def test_runs_list_shows_separate_etrn_batches(self) -> None:
         self.get_recent.return_value = [
