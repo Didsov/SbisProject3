@@ -227,11 +227,70 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
             routes,
             {
                 ("GET", "/admin"),
+                ("GET", "/admin/api/runs"),
                 ("GET", "/admin/runs"),
                 ("GET", "/admin/runs/{run_id}"),
                 ("GET", "/admin/messages/{message_id}"),
             },
         )
+
+    async def test_runs_api_uses_existing_aggregates(self) -> None:
+        self.get_recent.return_value = [RUN]
+
+        response = await self.client.get("/admin/api/runs")
+        payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.content_type, "application/json")
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertEqual(
+            payload,
+            {
+                "runs": [
+                    {
+                        "run_id": 7,
+                        "batch_number": None,
+                        "campaign_family": "new_companies",
+                        "campaign_name": "Campaign <unsafe>",
+                        "started_at": "2026-08-20 09:00:00",
+                        "finished_at": "2026-08-20 09:12:00",
+                        "duration": "12 мин",
+                        "recipients": 2,
+                        "sent": 2,
+                        "unique_opens": 1,
+                        "unique_clicks": 1,
+                        "status": "partial",
+                        "status_label": "⚠ Частично",
+                        "status_class": "partial",
+                    }
+                ]
+            },
+        )
+        self.get_recent.assert_called_once_with(
+            limit=admin_app.RECENT_RUNS_LIMIT
+        )
+
+    async def test_admin_pages_enable_polling_without_reload(self) -> None:
+        for path in (
+            "/admin",
+            "/admin/runs",
+            "/admin/runs/7",
+            "/admin/messages/21",
+        ):
+            with self.subTest(path=path):
+                response = await self.client.get(path)
+                page_html = await response.text()
+                self.assertEqual(response.status, 200)
+                self.assertIn("data-admin-live-region", page_html)
+                self.assertIn("window.setInterval(poll, intervalMs)", page_html)
+                self.assertIn('cache: "no-store"', page_html)
+                self.assertNotIn("location.reload", page_html)
+
+        runs_response = await self.client.get("/admin/runs")
+        runs_html = await runs_response.text()
+        self.assertIn('fetch("/admin/api/runs"', runs_html)
+        self.assertIn("tbody.appendChild(row)", runs_html)
+        self.assertIn("row.dataset.runId", runs_html)
 
     async def test_dashboard_and_runs_list(self) -> None:
         dashboard_response = await self.client.get(

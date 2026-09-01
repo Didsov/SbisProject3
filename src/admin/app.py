@@ -25,6 +25,7 @@ ADMIN_PORT = 8081
 ADMIN_URL = f"http://{ADMIN_HOST}:{ADMIN_PORT}/admin"
 RECENT_RUNS_LIMIT = 100
 RECENT_EVENTS_LIMIT = 100
+ADMIN_POLL_INTERVAL_MS = 3000
 
 
 PAGE_STYLE = """
@@ -183,6 +184,20 @@ CLICK_CHANNEL_LABELS = {
     "cta_email": "Email",
 }
 
+RUN_HEADERS = (
+    "Запуск",
+    "Batch",
+    "Семейство",
+    "Кампания",
+    "Начало",
+    "Длительность",
+    "Получатели",
+    "Отправлено",
+    "Открытия",
+    "Клики",
+    "Статус",
+)
+
 
 def _value(value: object) -> str:
     """Безопасно подготовить значение БД для HTML."""
@@ -224,13 +239,21 @@ def _display_run_status(
     run: Mapping[str, object],
 ) -> str:
     """Показать статус запуска без изменения значения в БД."""
+    label, css_class = _run_status_parts(run)
+    return (
+        f'<span class="status status-{escape(css_class, quote=True)}">'
+        f"{escape(label)}</span>"
+    )
+
+
+def _run_status_parts(
+    run: Mapping[str, object],
+) -> tuple[str, str]:
+    """Вернуть тот же текст и CSS-класс статуса для HTML и JSON API."""
     if _is_empty_successful_run(run):
-        return (
-            '<span class="status status-empty">'
-            "○ Нет новых получателей"
-            "</span>"
-        )
-    return _run_status(run.get("status"))
+        return "○ Нет новых получателей", "empty"
+    status = str(run.get("status") or "unknown")
+    return RUN_STATUSES.get(status, (status, "unknown"))
 
 
 def _latest_check_text(
@@ -319,13 +342,22 @@ def _click_channels(timeline: Sequence[Mapping[str, object]]) -> str:
     return escape(", ".join(sorted(channels)))
 
 
-def _duration(started_at: object, finished_at: object) -> str:
-    """Вернуть человекочитаемую длительность завершённого запуска."""
-    if not started_at or not finished_at:
+def _duration(
+    started_at: object,
+    finished_at: object,
+    *,
+    running: bool = False,
+) -> str:
+    """Вернуть длительность завершённого или выполняющегося запуска."""
+    if not started_at or (not finished_at and not running):
         return "—"
     try:
         started = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
-        finished = datetime.fromisoformat(str(finished_at).replace("Z", "+00:00"))
+        finished = (
+            datetime.fromisoformat(str(finished_at).replace("Z", "+00:00"))
+            if finished_at
+            else datetime.now(tz=started.tzinfo)
+        )
         total_seconds = int((finished - started).total_seconds())
     except (TypeError, ValueError):
         return "—"
@@ -339,9 +371,183 @@ def _duration(started_at: object, finished_at: object) -> str:
     return f"{minutes} мин"
 
 
+def _run_duration(run: Mapping[str, object]) -> str:
+    """Посчитать длительность run, включая текущую длительность running."""
+    return _duration(
+        run.get("started_at"),
+        run.get("finished_at"),
+        running=run.get("status") == "running",
+    )
+
+
+def _serialize_run(run: Mapping[str, object]) -> dict[str, object]:
+    """Подготовить строку списка runs для read-only JSON API."""
+    status_label, status_class = _run_status_parts(run)
+    return {
+        "run_id": int(run["run_id"]),
+        "batch_number": run.get("batch_number"),
+        "campaign_family": run.get("campaign_family"),
+        "campaign_name": run.get("campaign_name"),
+        "started_at": run.get("started_at"),
+        "finished_at": run.get("finished_at"),
+        "duration": _run_duration(run),
+        "recipients": int(run.get("recipients_added") or 0),
+        "sent": int(run.get("sent_count") or 0),
+        "unique_opens": int(run.get("unique_open_count") or 0),
+        "unique_clicks": int(run.get("unique_click_count") or 0),
+        "status": str(run.get("status") or "unknown"),
+        "status_label": status_label,
+        "status_class": status_class,
+    }
+
+
+ADMIN_POLLING_SCRIPT = r"""
+<script>
+(() => {
+    const intervalMs = __POLL_INTERVAL__;
+    const liveRegion = document.querySelector("[data-admin-live-region]");
+    if (!liveRegion) return;
+    let requestRunning = false;
+
+    const setRunCell = (cell, run, value, options = {}) => {
+        const href = `/admin/runs/${run.run_id}`;
+        let link = cell.querySelector("a.row-cell-link");
+        if (!link) {
+            link = document.createElement("a");
+            link.className = "row-cell-link";
+            cell.replaceChildren(link);
+        }
+        link.href = href;
+        if (options.status) {
+            const badge = document.createElement("span");
+            badge.className = `status status-${run.status_class}`;
+            badge.textContent = run.status_label;
+            link.replaceChildren(badge);
+            return;
+        }
+        if (value === null || value === "") {
+            const muted = document.createElement("span");
+            muted.className = "muted";
+            muted.textContent = "—";
+            link.replaceChildren(muted);
+            return;
+        }
+        if (options.strong) {
+            const strong = document.createElement("strong");
+            strong.className = "numeric";
+            strong.textContent = String(value);
+            link.replaceChildren(strong);
+            return;
+        }
+        link.textContent = String(value);
+    };
+
+    const createRunRow = (run, table) => {
+        const row = document.createElement("tr");
+        const headers = Array.from(table.querySelectorAll("thead th"));
+        for (const header of headers) {
+            const cell = document.createElement("td");
+            cell.dataset.label = header.textContent;
+            row.appendChild(cell);
+        }
+        row.dataset.runId = String(run.run_id);
+        return row;
+    };
+
+    const updateRunRow = (row, run) => {
+        row.dataset.runId = String(run.run_id);
+        const cells = row.cells;
+        setRunCell(cells[0], run, `#${run.run_id}`, {strong: true});
+        setRunCell(cells[1], run, run.batch_number);
+        setRunCell(cells[2], run, run.campaign_family);
+        setRunCell(cells[3], run, run.campaign_name);
+        setRunCell(cells[4], run, run.started_at);
+        setRunCell(cells[5], run, run.duration);
+        setRunCell(cells[6], run, run.recipients);
+        setRunCell(cells[7], run, run.sent);
+        setRunCell(cells[8], run, run.unique_opens);
+        setRunCell(cells[9], run, run.unique_clicks);
+        setRunCell(cells[10], run, run.status, {status: true});
+    };
+
+    const refreshRuns = async () => {
+        const response = await fetch("/admin/api/runs", {cache: "no-store"});
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const payload = await response.json();
+        const table = document.getElementById("runs-table");
+        const tableWrap = document.getElementById("runs-table-wrap");
+        const emptyState = document.getElementById("runs-empty");
+        if (!table || !tableWrap || !emptyState || !Array.isArray(payload.runs)) return;
+        const tbody = table.tBodies[0];
+
+        for (const row of tbody.rows) {
+            if (row.dataset.runId) continue;
+            const href = row.querySelector("a.row-cell-link")?.getAttribute("href") || "";
+            const match = href.match(/\/admin\/runs\/(\d+)$/);
+            if (match) row.dataset.runId = match[1];
+        }
+
+        const rowsById = new Map(
+            Array.from(tbody.rows).map(row => [row.dataset.runId, row])
+        );
+        const activeIds = new Set();
+        for (const run of payload.runs) {
+            const key = String(run.run_id);
+            const row = rowsById.get(key) || createRunRow(run, table);
+            updateRunRow(row, run);
+            tbody.appendChild(row);
+            activeIds.add(key);
+        }
+        for (const row of Array.from(tbody.rows)) {
+            if (!activeIds.has(row.dataset.runId)) row.remove();
+        }
+        const hasRuns = payload.runs.length > 0;
+        tableWrap.hidden = !hasRuns;
+        emptyState.hidden = hasRuns;
+    };
+
+    const refreshCurrentPage = async () => {
+        const response = await fetch(window.location.pathname, {cache: "no-store"});
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const source = await response.text();
+        const documentCopy = new DOMParser().parseFromString(source, "text/html");
+        const nextRegion = documentCopy.querySelector("[data-admin-live-region]");
+        if (nextRegion && nextRegion.innerHTML !== liveRegion.innerHTML) {
+            liveRegion.replaceChildren(
+                ...Array.from(nextRegion.childNodes).map(node => document.importNode(node, true))
+            );
+        }
+    };
+
+    const poll = async () => {
+        if (requestRunning) return;
+        requestRunning = true;
+        try {
+            if (window.location.pathname === "/admin/runs") {
+                await refreshRuns();
+            } else {
+                await refreshCurrentPage();
+            }
+        } catch (error) {
+            console.warn("ProjectSbis admin polling failed", error);
+        } finally {
+            requestRunning = false;
+        }
+    };
+
+    window.setInterval(poll, intervalMs);
+})();
+</script>
+"""
+
+
 def _page(*, title: str, content: str) -> str:
     """Собрать общую HTML-обвязку страницы."""
     safe_title = escape(title)
+    polling_script = ADMIN_POLLING_SCRIPT.replace(
+        "__POLL_INTERVAL__",
+        str(ADMIN_POLL_INTERVAL_MS),
+    )
     return f"""<!doctype html>
 <html lang="ru">
 <head>
@@ -361,8 +567,9 @@ def _page(*, title: str, content: str) -> str:
                 <a href="/admin/runs">Запуски</a>
             </nav>
         </header>
-        {content}
+        <div data-admin-live-region>{content}</div>
     </main>
+    {polling_script}
 </body>
 </html>"""
 
@@ -465,6 +672,56 @@ def _table(
     )
 
 
+def _runs_table(runs: Sequence[Mapping[str, object]]) -> str:
+    """Собрать таблицу runs с устойчивыми DOM-узлами для polling."""
+    rows = [
+        (
+            (
+                f'<strong class="numeric">#{_value(run["run_id"])}</strong>',
+                _value(run["batch_number"]),
+                _value(run["campaign_family"]),
+                _value(run["campaign_name"]),
+                _value(run["started_at"]),
+                escape(_run_duration(run)),
+                _value(run["recipients_added"]),
+                _value(run["sent_count"]),
+                _value(run["unique_open_count"]),
+                _value(run["unique_click_count"]),
+                _display_run_status(run),
+            ),
+            f'/admin/runs/{int(run["run_id"])}',
+        )
+        for run in runs
+    ]
+    if rows:
+        table = _table(
+            headers=RUN_HEADERS,
+            rows=rows,
+            empty_text="Запуски рассылки пока отсутствуют.",
+        )
+        table = table.replace(
+            '<div class="table-wrap">',
+            '<div class="table-wrap" id="runs-table-wrap">',
+            1,
+        ).replace("<table>", '<table id="runs-table">', 1)
+        empty_hidden = " hidden"
+    else:
+        header_html = "".join(
+            f"<th>{escape(header)}</th>" for header in RUN_HEADERS
+        )
+        table = (
+            '<div class="table-wrap" id="runs-table-wrap" hidden>'
+            '<table id="runs-table"><thead><tr>'
+            f"{header_html}</tr></thead><tbody></tbody></table></div>"
+        )
+        empty_hidden = ""
+    return (
+        table
+        + f'<div class="panel empty" id="runs-empty"{empty_hidden}>'
+        + "Запуски рассылки пока отсутствуют.</div>"
+    )
+
+
 def _event_data(value: object) -> str:
     """Спрятать технические данные события под раскрываемым блоком."""
     if value is None or value == "":
@@ -510,6 +767,7 @@ async def handle_admin(request: web.Request) -> web.Response:
                         _duration(
                             latest_run["started_at"],
                             latest_run["finished_at"],
+                            running=latest_run["status"] == "running",
                         )
                     ),
                 ),
@@ -552,6 +810,7 @@ async def handle_admin(request: web.Request) -> web.Response:
     mailing_duration = _duration(
         latest_mailing["started_at"],
         latest_mailing["finished_at"],
+        running=latest_mailing["status"] == "running",
     )
     content = (
         heading
@@ -592,41 +851,7 @@ async def handle_runs(request: web.Request) -> web.Response:
     """Показать последние запуски рассылки."""
     del request
     runs = get_recent_mail_runs(limit=RECENT_RUNS_LIMIT)
-    table = _table(
-        headers=(
-            "Запуск",
-            "Batch",
-            "Семейство",
-            "Кампания",
-            "Начало",
-            "Длительность",
-            "Получатели",
-            "Отправлено",
-            "Открытия",
-            "Клики",
-            "Статус",
-        ),
-        rows=(
-            (
-                (
-                    f'<strong class="numeric">#{_value(run["run_id"])}</strong>',
-                    _value(run["batch_number"]),
-                    _value(run["campaign_family"]),
-                    _value(run["campaign_name"]),
-                    _value(run["started_at"]),
-                    escape(_duration(run["started_at"], run["finished_at"])),
-                    _value(run["recipients_added"]),
-                    _value(run["sent_count"]),
-                    _value(run["unique_open_count"]),
-                    _value(run["unique_click_count"]),
-                    _display_run_status(run),
-                ),
-                f'/admin/runs/{int(run["run_id"])}',
-            )
-            for run in runs
-        ),
-        empty_text="Запуски рассылки пока отсутствуют.",
-    )
+    table = _runs_table(runs)
     content = (
         '<div class="page-heading"><div class="eyebrow">Рассылки</div>'
         '<h1>История запусков</h1>'
@@ -634,6 +859,16 @@ async def handle_runs(request: web.Request) -> web.Response:
         + table
     )
     return _response(title="Запуски", content=content)
+
+
+async def handle_runs_api(request: web.Request) -> web.Response:
+    """Вернуть последние runs тем же запросом, что использует HTML-страница."""
+    del request
+    runs = get_recent_mail_runs(limit=RECENT_RUNS_LIMIT)
+    return web.json_response(
+        {"runs": [_serialize_run(run) for run in runs]},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 def _parse_run_id(request: web.Request) -> int:
@@ -748,7 +983,7 @@ async def handle_run_details(request: web.Request) -> web.Response:
         ),
         empty_text="У запуска нет событий.",
     )
-    duration = _duration(details["started_at"], details["finished_at"])
+    duration = _run_duration(details)
     preparation = ""
     if details["campaign_family"] == "etrn":
         preparation = (
@@ -930,6 +1165,7 @@ def create_app() -> web.Application:
     """Создать read-only aiohttp-приложение админки."""
     app = web.Application()
     app.router.add_get("/admin", handle_admin)
+    app.router.add_get("/admin/api/runs", handle_runs_api)
     app.router.add_get("/admin/runs", handle_runs)
     app.router.add_get("/admin/runs/{run_id}", handle_run_details)
     app.router.add_get(
