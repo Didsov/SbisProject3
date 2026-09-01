@@ -531,7 +531,7 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
         for email in smtp_addresses + [row["email"] for row in recipients]:
             self.assertNotIn(email, output.getvalue())
 
-    async def test_real_worker_uses_persistent_batch_cooldown(self) -> None:
+    async def test_worker_exits_during_cooldown_and_next_run_continues(self) -> None:
         for number in range(3):
             client_id = self.add_client(
                 f"25000001{number:02d}",
@@ -546,14 +546,10 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
         provider = AsyncMock()
         provider.send.return_value = SMTPSendResult(True, "message-id")
 
-        async def stop_during_cooldown(delay: int) -> None:
-            if delay >= 2400:
-                raise asyncio.CancelledError
-
         with (
             patch.object(etrn, "ATTACHMENTS_DIR", attachment_dir),
             patch.object(etrn.SMTPMailProvider, "from_env", return_value=provider),
-            patch.object(etrn.asyncio, "sleep", side_effect=stop_during_cooldown),
+            patch.object(etrn.asyncio, "sleep", new=AsyncMock()),
             patch.dict(
                 "os.environ",
                 {
@@ -566,7 +562,6 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
                 },
             ),
             redirect_stdout(io.StringIO()),
-            self.assertRaises(asyncio.CancelledError),
         ):
             await etrn.send_campaign(dry_run=False, confirm_real_send=True)
 
@@ -580,8 +575,57 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
                 "SELECT status FROM mail_recipients WHERE campaign_id = ? ORDER BY id",
                 (campaign_id,),
             ).fetchall()]
+            run_count = connection.execute(
+                "SELECT COUNT(*) FROM mail_runs WHERE campaign_id = ?",
+                (campaign_id,),
+            ).fetchone()[0]
         self.assertIsNotNone(campaign["next_send_at"])
         self.assertEqual(statuses, ["sent", "sent", "pending"])
+        self.assertEqual(run_count, 1)
+
+        with (
+            patch.object(etrn, "load_attachments") as load_attachments,
+            patch.object(etrn.SMTPMailProvider, "from_env") as provider_factory,
+            patch.object(etrn.asyncio, "sleep", new=AsyncMock()) as cooldown_sleep,
+            patch.dict(
+                "os.environ",
+                {
+                    "ETRN_BATCH_LIMIT": "2",
+                    "ETRN_TEST_RECIPIENTS_ENABLED": "false",
+                    "ETRN_MESSAGE_DELAY_MIN_SECONDS": "0",
+                    "ETRN_MESSAGE_DELAY_MAX_SECONDS": "0",
+                    "ETRN_COOLDOWN_MIN_SECONDS": "2400",
+                    "ETRN_COOLDOWN_MAX_SECONDS": "2400",
+                },
+            ),
+            redirect_stdout(cooldown_output := io.StringIO()),
+        ):
+            await etrn.send_campaign(dry_run=False, confirm_real_send=True)
+
+        load_attachments.assert_not_called()
+        provider_factory.assert_not_called()
+        cooldown_sleep.assert_not_awaited()
+        self.assertIn("ETRN_COOLDOWN_ACTIVE", cooldown_output.getvalue())
+        self.assertIn("next_send_at=", cooldown_output.getvalue())
+        self.assertIn("remaining_seconds=", cooldown_output.getvalue())
+        with closing(database.get_connection()) as connection:
+            statuses_during_cooldown = [row["status"] for row in connection.execute(
+                "SELECT status FROM mail_recipients WHERE campaign_id = ? ORDER BY id",
+                (campaign_id,),
+            ).fetchall()]
+            run_count_during_cooldown = connection.execute(
+                "SELECT COUNT(*) FROM mail_runs WHERE campaign_id = ?",
+                (campaign_id,),
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE mail_campaigns SET next_send_at = '2000-01-01 00:00:00' "
+                "WHERE id = ?",
+                (campaign_id,),
+            )
+            connection.commit()
+        self.assertEqual(statuses_during_cooldown, statuses)
+        self.assertEqual(run_count_during_cooldown, run_count)
+        self.assertEqual(provider.send.await_count, 2)
 
         with (
             patch.object(etrn, "ATTACHMENTS_DIR", attachment_dir),

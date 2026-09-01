@@ -1,0 +1,10 @@
+[Unit]
+Description=ProjectSbis ETRN Mailing Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/projectsbis/repository
+EnvironmentFile=/etc/projectsbis/projectsbis.env
+ExecStart=/opt/projectsbis/repository/.venv/bin/python -m src.mailing.etrn send --confirm-real-send

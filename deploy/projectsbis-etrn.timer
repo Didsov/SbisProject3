@@ -1,0 +1,10 @@
+[Unit]
+Description=Run ProjectSbis ETRN mailing worker every 5 minutes
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=true
+Unit=projectsbis-etrn.service
+
+[Install]
+WantedBy=timers.target

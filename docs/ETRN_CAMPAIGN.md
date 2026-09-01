@@ -107,11 +107,65 @@ Worker выбирает из одной очереди кампании толь
 
 После каждого завершённого run при наличии остатка очереди выбирается случайный
 cooldown 2400–3000 секунд. Абсолютное UTC-время продолжения хранится в
-`mail_campaigns.next_send_at`. Worker ждёт до этого времени и создаёт следующий
-run. После рестарта незавершённый run закрывается как `failed`, уже отправленные
-адреса остаются `sent`, а worker выдерживает сохранённый остаток cooldown и
-продолжает оставшуюся очередь. Старое поле `batch_sent_count` больше не участвует
-в ограничении партий.
+`mail_campaigns.next_send_at`. Worker завершается на время cooldown; следующий
+запуск до сохранённого времени также успешно завершается без нового run и SMTP.
+После рестарта незавершённый run закрывается как `failed`, уже отправленные
+адреса остаются `sent`, а timer продолжает оставшуюся очередь после cooldown.
+Старое поле `batch_sent_count` больше не участвует в ограничении партий.
+
+## Автоматический запуск batch через systemd
+
+Timer каждые пять минут активирует тот же CLI worker с конфигурацией из
+`/etc/projectsbis/projectsbis.env`:
+
+```text
+prepare
+→ pending N
+→ projectsbis-etrn.timer каждые 5 минут
+→ batch не больше 500
+→ cooldown 40–50 минут в mail_campaigns.next_send_at
+→ следующий batch
+→ пока pending = 0
+```
+
+Например, для `1387 pending` будут созданы отдельные runs:
+
+```text
+batch #1 = 500
+через ~40–50 минут
+batch #2 = 500
+через ~40–50 минут
+batch #3 = 387
+```
+
+Cooldown не дублируется в systemd: worker читает абсолютное UTC-время из
+`mail_campaigns.next_send_at` и не создаёт следующий run раньше него. Если время
+ещё не наступило, oneshot выводит `ETRN_COOLDOWN_ACTIVE` с оставшимся временем и
+успешно завершается. Когда очередь пуста, worker также завершается без отправки,
+а timer остаётся включённым.
+
+Отдельного межпроцессного lock внутри ETRN worker сейчас нет. Атомарное создание
+номера batch защищает только `mail_runs.batch_number`, но не всю выборку и SMTP.
+Поэтому ручной запуск на сервере следует выполнять через
+`systemctl start projectsbis-etrn.service`, а не параллельной прямой CLI-командой:
+systemd сериализует запуски одного unit.
+
+Установка:
+
+```bash
+sudo cp deploy/projectsbis-etrn.service /etc/systemd/system/
+sudo cp deploy/projectsbis-etrn.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now projectsbis-etrn.timer
+```
+
+Проверка:
+
+```bash
+systemctl status projectsbis-etrn.timer
+systemctl list-timers --all | grep projectsbis-etrn
+journalctl -u projectsbis-etrn.service -n 200 --no-pager
+```
 
 Логи имеют вид:
 

@@ -455,6 +455,22 @@ def _campaign_cooldown(campaign_id: int) -> datetime | None:
     return value if value > datetime.now(timezone.utc) else None
 
 
+def _report_active_cooldown(campaign_id: int) -> bool:
+    cooldown = _campaign_cooldown(campaign_id)
+    if cooldown is None:
+        return False
+    remaining = max(
+        1,
+        int((cooldown - datetime.now(timezone.utc)).total_seconds()) + 1,
+    )
+    print(
+        "ETRN_COOLDOWN_ACTIVE\n"
+        f"next_send_at={cooldown.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"remaining_seconds={remaining}"
+    )
+    return True
+
+
 def _pending_queue_count(campaign_id: int) -> int:
     with closing(get_connection()) as connection, connection:
         return int(connection.execute(
@@ -575,6 +591,8 @@ async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
         )
     initialize_database()
     campaign_id = ensure_etrn_campaign()
+    if not dry_run and _report_active_cooldown(campaign_id):
+        return
     attachments = [] if disable_attachments else load_attachments()
     template = get_mail_template(TEMPLATE_NAME)
     if dry_run:
@@ -609,17 +627,10 @@ async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
     recovered_runs = _recover_interrupted_runs(campaign_id)
     if recovered_runs and _pending_queue_count(campaign_id) and not _campaign_cooldown(campaign_id):
         _set_cooldown(campaign_id, _cooldown_duration())
+    if _report_active_cooldown(campaign_id):
+        return
 
     while True:
-        cooldown = _campaign_cooldown(campaign_id)
-        if cooldown is not None:
-            delay = max(
-                1,
-                int((cooldown - datetime.now(timezone.utc)).total_seconds()) + 1,
-            )
-            print(f"ETRN_COOLDOWN\nduration={delay}s\nuntil={cooldown.isoformat()}")
-            await asyncio.sleep(delay)
-
         recipients = _eligible_recipients(campaign_id, batch_size)
         if not recipients:
             if _pending_queue_count(campaign_id) == 0:
@@ -757,6 +768,7 @@ async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
         duration = _cooldown_duration()
         until = _set_cooldown(campaign_id, duration)
         print(f"ETRN_COOLDOWN_SET\nduration={duration}s\nuntil={until.isoformat()}")
+        return
 
 
 def campaign_stats() -> dict[str, int]:
