@@ -269,7 +269,12 @@ def get_messages_for_delivery_check(
                 'unknown',
                 'deferred'
             )
-        ORDER BY id
+        ORDER BY
+            CASE
+                WHEN delivery_status = 'unknown' THEN 0
+                ELSE 1
+            END,
+            id DESC
     """
 
     params: list[object] = []
