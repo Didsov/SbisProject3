@@ -95,9 +95,15 @@ h2 { margin: 32px 0 14px; color: #273142; font-size: 20px; }
     overflow-x: auto; border: 1px solid #e1e7ef; border-radius: 14px;
     background: #fff; box-shadow: 0 8px 26px rgba(26, 39, 66, .045);
 }
+.wide-table-wrap { max-width: 100%; overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; }
+.wide-table { min-width: 1500px; }
 th, td { padding: 13px 14px; border-bottom: 1px solid #eaecf0; text-align: left; vertical-align: middle; }
 th { background: #f8fafc; color: #667085; font-size: 11px; font-weight: 750; letter-spacing: .025em; white-space: nowrap; }
+th[data-sort-index] { cursor: pointer; user-select: none; }
+th[data-sort-index]::after { content: " ↕"; color: #98a2b3; }
+th[aria-sort="ascending"]::after { content: " ↑"; color: #175cd3; }
+th[aria-sort="descending"]::after { content: " ↓"; color: #175cd3; }
 td { color: #344054; font-size: 13px; }
 tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover { background: #f8fbff; }
@@ -111,6 +117,16 @@ tbody tr:hover { background: #f8fbff; }
     padding: 10px; overflow: auto; border-radius: 8px; background: #f5f7fa;
     color: #344054; font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere;
 }
+.table-controls {
+    display: flex; flex-wrap: wrap; gap: 10px; margin: 0 0 12px;
+    padding: 12px; border: 1px solid #e1e7ef; border-radius: 12px; background: #fff;
+}
+.table-controls input, .table-controls select {
+    min-height: 38px; padding: 7px 10px; border: 1px solid #d0d5dd;
+    border-radius: 8px; background: #fff; color: #344054; font: inherit;
+}
+.table-controls input { flex: 1 1 260px; min-width: 180px; }
+.table-controls select { flex: 0 1 210px; }
 .empty { padding: 40px 24px; text-align: center; color: #667085; }
 @media (max-width: 1100px) {
     .metrics { grid-template-columns: repeat(3, 1fr); }
@@ -136,6 +152,13 @@ tbody tr:hover { background: #f8fbff; }
     td::before { content: attr(data-label); color: #667085; font-size: 11px; font-weight: 720; }
     .row-cell-link { margin: -10px -12px; padding: 10px 12px; }
     .event-data code { max-width: 100%; }
+    .wide-table-wrap { overflow-x: auto; border: 1px solid #e1e7ef; border-radius: 12px; background: #fff; }
+    .wide-table-wrap .wide-table { display: table; width: 100%; min-width: 1500px; }
+    .wide-table-wrap .wide-table thead { display: table-header-group; }
+    .wide-table-wrap .wide-table tbody { display: table-row-group; }
+    .wide-table-wrap .wide-table tr { display: table-row; border: 0; box-shadow: none; }
+    .wide-table-wrap .wide-table td { display: table-cell; padding: 10px 12px; }
+    .wide-table-wrap .wide-table td::before { display: none; }
 }
 @media (max-width: 420px) {
     .metrics { grid-template-columns: 1fr; }
@@ -409,6 +432,171 @@ ADMIN_POLLING_SCRIPT = r"""
     if (!liveRegion) return;
     let requestRunning = false;
 
+    const findByDataKey = (selector, dataName, key) =>
+        Array.from(liveRegion.querySelectorAll(selector))
+            .find(element => element.dataset[dataName] === key);
+
+    const sortValue = value => {
+        const normalized = value.trim().replace(/^#/, "").replace(",", ".");
+        if (/^-?\d+(\.\d+)?$/.test(normalized)) {
+            return {kind: "number", value: Number(normalized)};
+        }
+        return {kind: "text", value: normalized.toLocaleLowerCase("ru")};
+    };
+
+    const applyTableSort = table => {
+        const column = Number.parseInt(table.dataset.sortColumn || "", 10);
+        if (!Number.isInteger(column)) return;
+        const direction = table.dataset.sortDirection === "descending" ? -1 : 1;
+        const tbody = table.tBodies[0];
+        if (!tbody) return;
+        const rows = Array.from(tbody.rows);
+        rows.sort((left, right) => {
+            const leftValue = sortValue(left.cells[column]?.textContent || "");
+            const rightValue = sortValue(right.cells[column]?.textContent || "");
+            if (leftValue.kind === "number" && rightValue.kind === "number") {
+                return direction * (leftValue.value - rightValue.value);
+            }
+            return direction * String(leftValue.value).localeCompare(
+                String(rightValue.value), "ru", {numeric: true, sensitivity: "base"}
+            );
+        });
+        for (const row of rows) tbody.appendChild(row);
+        for (const header of table.querySelectorAll("th[data-sort-index]")) {
+            header.setAttribute(
+                "aria-sort",
+                Number(header.dataset.sortIndex) === column
+                    ? table.dataset.sortDirection
+                    : "none"
+            );
+        }
+    };
+
+    const filterValue = key =>
+        findByDataKey("[data-filter-key]", "filterKey", key)?.value || "";
+
+    const applyRunMessageFilters = () => {
+        const table = findByDataKey("table[data-table-key]", "tableKey", "run-messages");
+        if (!table?.tBodies[0]) return;
+        const query = filterValue("run-message-query").trim().toLocaleLowerCase("ru");
+        const delivery = filterValue("run-message-delivery");
+        const testMode = filterValue("run-message-test");
+        const engagement = filterValue("run-message-engagement");
+        for (const row of table.tBodies[0].rows) {
+            const searchText = Array.from(row.cells)
+                .slice(0, 4)
+                .map(cell => cell.textContent || "")
+                .join(" ")
+                .toLocaleLowerCase("ru");
+            const deliveryMatches = !delivery
+                || row.cells[6]?.querySelector(`.status-${delivery}`) !== null;
+            const isTest = (row.cells[4]?.textContent || "").includes("TEST RECIPIENT");
+            const testMatches = !testMode
+                || (testMode === "test" ? isTest : !isTest);
+            const opens = Number.parseInt(row.cells[9]?.textContent || "0", 10) || 0;
+            const clicks = Number.parseInt(row.cells[10]?.textContent || "0", 10) || 0;
+            const engagementMatches = !engagement
+                || (engagement === "opened" && opens > 0)
+                || (engagement === "clicked" && clicks > 0)
+                || (engagement === "none" && opens === 0 && clicks === 0);
+            row.hidden = Boolean(
+                (query && !searchText.includes(query))
+                || !deliveryMatches
+                || !testMatches
+                || !engagementMatches
+            );
+        }
+    };
+
+    const captureUiState = () => ({
+        openDetails: Array.from(
+            liveRegion.querySelectorAll("details[data-detail-key][open]")
+        ).map(element => element.dataset.detailKey),
+        scroll: Array.from(liveRegion.querySelectorAll("[data-scroll-key]")).map(
+            element => ({
+                key: element.dataset.scrollKey,
+                left: element.scrollLeft,
+                top: element.scrollTop,
+            })
+        ),
+        filters: Array.from(liveRegion.querySelectorAll("[data-filter-key]")).map(
+            element => ({key: element.dataset.filterKey, value: element.value})
+        ),
+        sorts: Array.from(liveRegion.querySelectorAll("table[data-table-key]"))
+            .filter(table => table.dataset.sortColumn)
+            .map(table => ({
+                key: table.dataset.tableKey,
+                column: table.dataset.sortColumn,
+                direction: table.dataset.sortDirection,
+            })),
+    });
+
+    const restoreUiState = state => {
+        for (const key of state.openDetails) {
+            const details = findByDataKey(
+                "details[data-detail-key]", "detailKey", key
+            );
+            if (details) details.open = true;
+        }
+        for (const filter of state.filters) {
+            const control = findByDataKey(
+                "[data-filter-key]", "filterKey", filter.key
+            );
+            if (control) control.value = filter.value;
+        }
+        for (const sort of state.sorts) {
+            const table = findByDataKey(
+                "table[data-table-key]", "tableKey", sort.key
+            );
+            if (!table) continue;
+            table.dataset.sortColumn = sort.column;
+            table.dataset.sortDirection = sort.direction;
+            applyTableSort(table);
+        }
+        applyRunMessageFilters();
+        window.requestAnimationFrame(() => {
+            for (const position of state.scroll) {
+                const element = findByDataKey(
+                    "[data-scroll-key]", "scrollKey", position.key
+                );
+                if (element) {
+                    element.scrollLeft = position.left;
+                    element.scrollTop = position.top;
+                }
+            }
+        });
+    };
+
+    liveRegion.addEventListener("click", event => {
+        const header = event.target.closest("th[data-sort-index]");
+        if (!header || !liveRegion.contains(header)) return;
+        const table = header.closest("table[data-table-key]");
+        if (!table) return;
+        const column = header.dataset.sortIndex;
+        table.dataset.sortDirection = (
+            table.dataset.sortColumn === column
+            && table.dataset.sortDirection === "ascending"
+        ) ? "descending" : "ascending";
+        table.dataset.sortColumn = column;
+        applyTableSort(table);
+    });
+
+    liveRegion.addEventListener("keydown", event => {
+        if ((event.key === "Enter" || event.key === " ")
+                && event.target.matches("th[data-sort-index]")) {
+            event.preventDefault();
+            event.target.click();
+        }
+    });
+
+    liveRegion.addEventListener("input", event => {
+        if (event.target.matches("[data-filter-key]")) applyRunMessageFilters();
+    });
+
+    liveRegion.addEventListener("change", event => {
+        if (event.target.matches("[data-filter-key]")) applyRunMessageFilters();
+    });
+
     const setRunCell = (cell, run, value, options = {}) => {
         const href = `/admin/runs/${run.run_id}`;
         let link = cell.querySelector("a.row-cell-link");
@@ -504,6 +692,7 @@ ADMIN_POLLING_SCRIPT = r"""
         const hasRuns = payload.runs.length > 0;
         tableWrap.hidden = !hasRuns;
         emptyState.hidden = hasRuns;
+        applyTableSort(table);
     };
 
     const refreshCurrentPage = async () => {
@@ -513,9 +702,11 @@ ADMIN_POLLING_SCRIPT = r"""
         const documentCopy = new DOMParser().parseFromString(source, "text/html");
         const nextRegion = documentCopy.querySelector("[data-admin-live-region]");
         if (nextRegion && nextRegion.innerHTML !== liveRegion.innerHTML) {
+            const uiState = captureUiState();
             liveRegion.replaceChildren(
                 ...Array.from(nextRegion.childNodes).map(node => document.importNode(node, true))
             );
+            restoreUiState(uiState);
         }
     };
 
@@ -644,13 +835,28 @@ def _table(
     headers: Sequence[str],
     rows: Iterable[tuple[Sequence[str], str | None]],
     empty_text: str,
+    sortable: bool = False,
+    table_key: str | None = None,
+    table_id: str | None = None,
+    wrapper_id: str | None = None,
+    wrapper_class: str = "",
+    scroll_key: str | None = None,
+    table_class: str = "",
 ) -> str:
     """Собрать таблицу, которая на узком экране становится карточками."""
     rendered_rows = list(rows)
     if not rendered_rows:
         return f'<div class="panel empty">{escape(empty_text)}</div>'
 
-    header_html = "".join(f"<th>{escape(header)}</th>" for header in headers)
+    header_html = "".join(
+        (
+            f'<th data-sort-index="{index}" tabindex="0" role="button" '
+            f'aria-sort="none">{escape(header)}</th>'
+            if sortable
+            else f"<th>{escape(header)}</th>"
+        )
+        for index, header in enumerate(headers)
+    )
     rows_html: list[str] = []
     for cells, row_href in rendered_rows:
         safe_href = escape(row_href, quote=True) if row_href is not None else None
@@ -664,8 +870,23 @@ def _table(
             )
         rows_html.append("<tr>" + "".join(cell_html) + "</tr>")
 
+    wrapper_attributes = ""
+    if wrapper_id is not None:
+        wrapper_attributes += f' id="{escape(wrapper_id, quote=True)}"'
+    if scroll_key is not None:
+        wrapper_attributes += f' data-scroll-key="{escape(scroll_key, quote=True)}"'
+    table_attributes = ""
+    if table_id is not None:
+        table_attributes += f' id="{escape(table_id, quote=True)}"'
+    if table_key is not None:
+        table_attributes += f' data-table-key="{escape(table_key, quote=True)}"'
+    wrapper_classes = "table-wrap"
+    if wrapper_class:
+        wrapper_classes += f" {wrapper_class}"
+    table_classes = f' class="{escape(table_class, quote=True)}"' if table_class else ""
     return (
-        '<div class="table-wrap"><table>'
+        f'<div class="{wrapper_classes}"{wrapper_attributes}>'
+        f"<table{table_attributes}{table_classes}>"
         f"<thead><tr>{header_html}</tr></thead>"
         f'<tbody>{"".join(rows_html)}</tbody>'
         "</table></div>"
@@ -698,20 +919,23 @@ def _runs_table(runs: Sequence[Mapping[str, object]]) -> str:
             headers=RUN_HEADERS,
             rows=rows,
             empty_text="Запуски рассылки пока отсутствуют.",
+            sortable=True,
+            table_key="runs",
+            table_id="runs-table",
+            wrapper_id="runs-table-wrap",
+            scroll_key="runs",
         )
-        table = table.replace(
-            '<div class="table-wrap">',
-            '<div class="table-wrap" id="runs-table-wrap">',
-            1,
-        ).replace("<table>", '<table id="runs-table">', 1)
         empty_hidden = " hidden"
     else:
         header_html = "".join(
-            f"<th>{escape(header)}</th>" for header in RUN_HEADERS
+            f'<th data-sort-index="{index}" tabindex="0" role="button" '
+            f'aria-sort="none">{escape(header)}</th>'
+            for index, header in enumerate(RUN_HEADERS)
         )
         table = (
-            '<div class="table-wrap" id="runs-table-wrap" hidden>'
-            '<table id="runs-table"><thead><tr>'
+            '<div class="table-wrap" id="runs-table-wrap" '
+            'data-scroll-key="runs" hidden>'
+            '<table id="runs-table" data-table-key="runs"><thead><tr>'
             f"{header_html}</tr></thead><tbody></tbody></table></div>"
         )
         empty_hidden = ""
@@ -722,14 +946,45 @@ def _runs_table(runs: Sequence[Mapping[str, object]]) -> str:
     )
 
 
-def _event_data(value: object) -> str:
+def _event_data(value: object, *, event_id: object) -> str:
     """Спрятать технические данные события под раскрываемым блоком."""
     if value is None or value == "":
         return '<span class="muted">—</span>'
     return (
-        '<details class="event-data"><summary>Данные</summary>'
+        '<details class="event-data" '
+        f'data-detail-key="event-{escape(str(event_id), quote=True)}">'
+        '<summary>Данные</summary>'
         f"<code>{escape(str(value))}</code></details>"
     )
+
+
+def _run_message_filters() -> str:
+    """Показать небольшие клиентские фильтры таблицы получателей."""
+    return """
+    <div class="table-controls" data-filter-controls="run-messages">
+        <input type="search" data-filter-key="run-message-query"
+               placeholder="Компания, email или ИНН"
+               aria-label="Поиск по компании, email или ИНН">
+        <select data-filter-key="run-message-delivery" aria-label="Delivery status">
+            <option value="">Все delivery status</option>
+            <option value="delivered">Delivered</option>
+            <option value="bounced">Bounced</option>
+            <option value="deferred">Deferred</option>
+            <option value="unknown">Unknown</option>
+        </select>
+        <select data-filter-key="run-message-test" aria-label="Test recipient">
+            <option value="">Все получатели</option>
+            <option value="test">TEST RECIPIENT</option>
+            <option value="production">Не test recipient</option>
+        </select>
+        <select data-filter-key="run-message-engagement" aria-label="Открытия и клики">
+            <option value="">Любая активность</option>
+            <option value="opened">Есть открытия</option>
+            <option value="clicked">Есть клики</option>
+            <option value="none">Нет открытий и кликов</option>
+        </select>
+    </div>
+    """
 
 
 async def handle_admin(request: web.Request) -> web.Response:
@@ -918,7 +1173,7 @@ async def handle_run_details(request: web.Request) -> web.Response:
             content_type="text/plain",
         ) from None
 
-    messages = get_mail_run_messages(run_id)
+    messages = get_mail_run_messages(run_id, include_test=True)
     events = get_mail_run_events(run_id)
     recent_events = list(reversed(events[-RECENT_EVENTS_LIMIT:]))
 
@@ -964,7 +1219,12 @@ async def handle_run_details(request: web.Request) -> web.Response:
             )
             for message in messages
         ),
-        empty_text="У запуска нет боевых сообщений.",
+        empty_text="У запуска нет сообщений.",
+        sortable=True,
+        table_key="run-messages",
+        wrapper_class="wide-table-wrap",
+        scroll_key="run-messages",
+        table_class="wide-table",
     )
     events_table = _table(
         headers=("Время", "Компания", "Email", "Событие", "Данные"),
@@ -975,13 +1235,19 @@ async def handle_run_details(request: web.Request) -> web.Response:
                     _value(event["company_name"]),
                     f'<span class="email">{_value(event["email"])}</span>',
                     _event_status(event["event_type"]),
-                    _event_data(event["event_data"]),
+                    _event_data(
+                        event["event_data"],
+                        event_id=event["event_id"],
+                    ),
                 ),
                 None,
             )
             for event in recent_events
         ),
         empty_text="У запуска нет событий.",
+        sortable=True,
+        table_key="run-events",
+        scroll_key="run-events",
     )
     duration = _run_duration(details)
     preparation = ""
@@ -1025,6 +1291,7 @@ async def handle_run_details(request: web.Request) -> web.Response:
         + "</section>"
         + preparation
         + "<h2>Получатели и сообщения</h2>"
+        + _run_message_filters()
         + messages_table
         + "<h2>Последние события</h2>"
         + events_table
@@ -1071,13 +1338,19 @@ async def handle_message_details(
                         event["event_type"],
                         event["event_data"],
                     ),
-                    _event_data(event["event_data"]),
+                    _event_data(
+                        event["event_data"],
+                        event_id=event["event_id"],
+                    ),
                 ),
                 None,
             )
             for event in timeline
         ),
         empty_text="У сообщения нет событий.",
+        sortable=True,
+        table_key="message-events",
+        scroll_key="message-events",
     )
     summary = _details(
         (
@@ -1120,7 +1393,8 @@ async def handle_message_details(
         )
     )
     technical_details = (
-        '<details class="event-data run-card">'
+        '<details class="event-data run-card" '
+        f'data-detail-key="message-technical-{message_id}">'
         "<summary>Технические данные</summary>"
         '<section class="panel run-card">'
         + _details(

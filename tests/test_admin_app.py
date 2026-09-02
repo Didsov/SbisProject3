@@ -291,6 +291,11 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn('fetch("/admin/api/runs"', runs_html)
         self.assertIn("tbody.appendChild(row)", runs_html)
         self.assertIn("row.dataset.runId", runs_html)
+        self.assertIn(
+            'if (window.location.pathname === "/admin/runs")',
+            runs_html,
+        )
+        self.assertNotIn("location.reload", runs_html)
 
     async def test_dashboard_and_runs_list(self) -> None:
         dashboard_response = await self.client.get(
@@ -412,15 +417,27 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
             'href="/admin/messages/21"',
             page_html,
         )
-        self.assertIn('<details class="event-data">', page_html)
+        self.assertIn(
+            '<details class="event-data" data-detail-key="event-31">',
+            page_html,
+        )
         self.assertIn("<summary>Данные</summary>", page_html)
+        self.assertIn('class="table-wrap wide-table-wrap"', page_html)
+        self.assertIn('data-scroll-key="run-messages"', page_html)
+        self.assertIn('class="wide-table"', page_html)
+        self.assertIn(".wide-table { min-width: 1500px; }", page_html)
+        self.assertIn('data-table-key="run-messages"', page_html)
+        self.assertIn('data-filter-key="run-message-query"', page_html)
+        self.assertIn('data-filter-key="run-message-delivery"', page_html)
+        self.assertIn('data-filter-key="run-message-test"', page_html)
+        self.assertIn('data-filter-key="run-message-engagement"', page_html)
         self.assertIn(
             '&lt;script&gt;alert(&quot;unsafe&quot;)&lt;/script&gt;',
             page_html,
         )
         self.assertNotIn("<script>alert", page_html)
         self.get_details.assert_called_once_with(7)
-        self.get_messages.assert_called_once_with(7)
+        self.get_messages.assert_called_once_with(7, include_test=True)
         self.get_events.assert_called_once_with(7)
 
     async def test_etrn_run_shows_preparation_breakdown(self) -> None:
@@ -523,9 +540,36 @@ class AdminAppHttpTestCase(unittest.IsolatedAsyncioTestCase):
             page_html,
         )
         self.assertNotIn("<script>alert(1)</script>", page_html)
-        self.assertIn('<details class="event-data">', page_html)
+        self.assertIn(
+            '<details class="event-data" data-detail-key="event-43">',
+            page_html,
+        )
+        self.assertIn(
+            'data-detail-key="message-technical-21"',
+            page_html,
+        )
         self.get_message_details.assert_called_once_with(21)
         self.get_message_timeline.assert_called_once_with(21)
+
+    async def test_polling_preserves_details_scroll_filters_and_sort(self) -> None:
+        response = await self.client.get("/admin/runs/7")
+        page_html = await response.text()
+
+        self.assertEqual(response.status, 200)
+        for code_fragment in (
+            "const uiState = captureUiState()",
+            "details[data-detail-key][open]",
+            "if (details) details.open = true",
+            "element.scrollLeft = position.left",
+            "element.scrollTop = position.top",
+            "if (control) control.value = filter.value",
+            "applyTableSort(table)",
+            "applyRunMessageFilters()",
+            "liveRegion.replaceChildren",
+            'fetch(window.location.pathname, {cache: "no-store"})',
+        ):
+            self.assertIn(code_fragment, page_html)
+        self.assertNotIn("location.reload", page_html)
 
     async def test_test_recipient_message_shows_real_and_smtp_email(self) -> None:
         self.get_message_details.return_value = {
