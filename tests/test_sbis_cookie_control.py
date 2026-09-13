@@ -518,6 +518,36 @@ class AuthAlertTestCase(unittest.IsolatedAsyncioTestCase):
             auth_alert.COOKIE_RECOVERY_COMMAND,
             message.text_body,
         )
+        self.assertIn(
+            auth_alert.COOKIE_CHECK_COMMAND,
+            message.text_body,
+        )
+        for expected_text in (
+            "Как получить актуальную cookie",
+            "DevTools (F12)",
+            "Request Headers",
+            "без префикса «Cookie:»",
+            "интерактивное восстановление cookie",
+            "скрыто через getpass",
+            "сначала проверяется запросом к СБИС",
+            "env-файл не изменяется",
+            "создаётся backup env-файла",
+            "auth-state переводится в HEALTHY",
+            "Не используйте document.cookie",
+        ):
+            self.assertIn(expected_text, message.text_body)
+        self.assertIn(
+            "sudo .venv/bin/python -m src.sbis.cookie_manager",
+            message.html_body,
+        )
+        self.assertIn(
+            ".venv/bin/python -m src.sbis.cookie_manager --check",
+            message.html_body,
+        )
+        self.assertNotRegex(
+            message.text_body,
+            r"src\.sbis\.cookie_manage(?:\s|$)",
+        )
 
     async def test_missing_alert_recipients_does_not_create_provider(self) -> None:
         provider_factory = Mock()
