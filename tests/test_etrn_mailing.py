@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlsplit
 
 import src.database as database
-from src.mailing import etrn
+from src.mailing import etrn, control
 from src.mailing.sender import MailMessage
 from src.mailing.smtp_provider import MailAttachment, SMTPMailProvider, SMTPSendResult
 from src.mailing.templates import etrn as etrn_template
@@ -28,8 +28,25 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
         self.db_patch = patch.object(database, "DATABASE_FILE", self.root / "test.db")
         self.db_patch.start()
         database.initialize_database()
+        import time
+        self.mail_now = time.time()
+        original_dispatch = control.dispatch
+        async def advance(seconds):
+            self.mail_now += seconds
+            with closing(database.get_connection()) as c, c:
+                c.execute('UPDATE mail_control SET heartbeat=?', (self.mail_now,))
+        async def dispatch(*args, **kwargs):
+            return await original_dispatch(*args, **kwargs, clock=lambda: self.mail_now, sleep=advance)
+        with closing(database.get_connection()) as c, c:
+            c.execute('UPDATE mail_control SET heartbeat=?', (self.mail_now,))
+        self.control_patches = [patch.object(control, 'provider_for', return_value='test'),
+                                patch.object(control, 'dispatch', side_effect=dispatch)]
+        for item in self.control_patches:
+            item.start()
 
     def tearDown(self) -> None:
+        for item in self.control_patches:
+            item.stop()
         self.db_patch.stop()
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", ResourceWarning)
@@ -531,7 +548,7 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
         for email in smtp_addresses + [row["email"] for row in recipients]:
             self.assertNotIn(email, output.getvalue())
 
-    async def test_worker_exits_during_cooldown_and_next_run_continues(self) -> None:
+    async def test_worker_drains_queue_without_batch_cooldown(self) -> None:
         for number in range(3):
             client_id = self.add_client(
                 f"25000001{number:02d}",
@@ -565,111 +582,14 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
         ):
             await etrn.send_campaign(dry_run=False, confirm_real_send=True)
 
-        self.assertEqual(provider.send.await_count, 2)
-        with closing(database.get_connection()) as connection:
-            campaign = connection.execute(
-                "SELECT next_send_at FROM mail_campaigns WHERE id = ?",
-                (campaign_id,),
-            ).fetchone()
-            statuses = [row["status"] for row in connection.execute(
-                "SELECT status FROM mail_recipients WHERE campaign_id = ? ORDER BY id",
-                (campaign_id,),
-            ).fetchall()]
-            run_count = connection.execute(
-                "SELECT COUNT(*) FROM mail_runs WHERE campaign_id = ?",
-                (campaign_id,),
-            ).fetchone()[0]
-        self.assertIsNotNone(campaign["next_send_at"])
-        self.assertEqual(statuses, ["sent", "sent", "pending"])
-        self.assertEqual(run_count, 1)
-
-        with (
-            patch.object(etrn, "load_attachments") as load_attachments,
-            patch.object(etrn.SMTPMailProvider, "from_env") as provider_factory,
-            patch.object(etrn.asyncio, "sleep", new=AsyncMock()) as cooldown_sleep,
-            patch.dict(
-                "os.environ",
-                {
-                    "ETRN_BATCH_LIMIT": "2",
-                    "ETRN_TEST_RECIPIENTS_ENABLED": "false",
-                    "ETRN_MESSAGE_DELAY_MIN_SECONDS": "0",
-                    "ETRN_MESSAGE_DELAY_MAX_SECONDS": "0",
-                    "ETRN_COOLDOWN_MIN_SECONDS": "2400",
-                    "ETRN_COOLDOWN_MAX_SECONDS": "2400",
-                },
-            ),
-            redirect_stdout(cooldown_output := io.StringIO()),
-        ):
-            await etrn.send_campaign(dry_run=False, confirm_real_send=True)
-
-        load_attachments.assert_not_called()
-        provider_factory.assert_not_called()
-        cooldown_sleep.assert_not_awaited()
-        self.assertIn("ETRN_COOLDOWN_ACTIVE", cooldown_output.getvalue())
-        self.assertIn("next_send_at=", cooldown_output.getvalue())
-        self.assertIn("remaining_seconds=", cooldown_output.getvalue())
-        with closing(database.get_connection()) as connection:
-            statuses_during_cooldown = [row["status"] for row in connection.execute(
-                "SELECT status FROM mail_recipients WHERE campaign_id = ? ORDER BY id",
-                (campaign_id,),
-            ).fetchall()]
-            run_count_during_cooldown = connection.execute(
-                "SELECT COUNT(*) FROM mail_runs WHERE campaign_id = ?",
-                (campaign_id,),
-            ).fetchone()[0]
-            connection.execute(
-                "UPDATE mail_campaigns SET next_send_at = '2000-01-01 00:00:00' "
-                "WHERE id = ?",
-                (campaign_id,),
-            )
-            connection.commit()
-        self.assertEqual(statuses_during_cooldown, statuses)
-        self.assertEqual(run_count_during_cooldown, run_count)
-        self.assertEqual(provider.send.await_count, 2)
-
-        with (
-            patch.object(etrn, "ATTACHMENTS_DIR", attachment_dir),
-            patch.object(etrn.SMTPMailProvider, "from_env", return_value=provider),
-            patch.object(etrn.asyncio, "sleep", new=AsyncMock()),
-            patch.dict(
-                "os.environ",
-                {
-                    "ETRN_BATCH_LIMIT": "2",
-                    "ETRN_TEST_RECIPIENTS_ENABLED": "false",
-                    "ETRN_MESSAGE_DELAY_MIN_SECONDS": "0",
-                    "ETRN_MESSAGE_DELAY_MAX_SECONDS": "0",
-                    "ETRN_COOLDOWN_MIN_SECONDS": "2400",
-                    "ETRN_COOLDOWN_MAX_SECONDS": "2400",
-                },
-            ),
-            redirect_stdout(io.StringIO()),
-        ):
-            await etrn.send_campaign(dry_run=False, confirm_real_send=True)
-
         self.assertEqual(provider.send.await_count, 3)
-        with closing(database.get_connection()) as connection:
-            runs = connection.execute(
-                """
-                SELECT batch_number, recipients_added, status
-                FROM mail_runs WHERE campaign_id = ? ORDER BY batch_number
-                """,
-                (campaign_id,),
-            ).fetchall()
-            statuses = [row["status"] for row in connection.execute(
-                "SELECT status FROM mail_recipients WHERE campaign_id = ? ORDER BY id",
-                (campaign_id,),
-            ).fetchall()]
-            next_send_at = connection.execute(
-                "SELECT next_send_at FROM mail_campaigns WHERE id = ?",
-                (campaign_id,),
-            ).fetchone()[0]
-        self.assertEqual(
-            [(row["batch_number"], row["recipients_added"]) for row in runs],
-            [(1, 2), (2, 1)],
-        )
-        self.assertEqual([row["status"] for row in runs], ["success", "success"])
-        self.assertEqual(statuses, ["sent", "sent", "sent"])
-        self.assertIsNone(next_send_at)
+        with closing(database.get_connection()) as c:
+            self.assertIsNone(c.execute('SELECT next_send_at FROM mail_campaigns WHERE id=?',
+                                        (campaign_id,)).fetchone()[0])
+            self.assertEqual([r[0] for r in c.execute('SELECT status FROM mail_recipients')],
+                             ['sent', 'sent', 'sent'])
+            timestamps = [r[0] for r in c.execute('SELECT handoff_at FROM mail_messages ORDER BY id')]
+        self.assertTrue(all(b-a >= 23 for a,b in zip(timestamps,timestamps[1:])))
 
     async def test_temporary_smtp_error_is_deferred_for_retry(self) -> None:
         client_id = self.add_client("2500000020", ["retry@example.ru"])

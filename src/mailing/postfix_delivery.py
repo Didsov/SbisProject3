@@ -7,7 +7,7 @@
 - определить внутренний Postfix queue ID;
 - найти результат доставки по queue ID;
 - преобразовать статусы Postfix в статусы проекта;
-- сохранить delivered / bounced / deferred через record_mail_delivery_status().
+- сохранить историю MX, статусы и состояние ограничений в SQLite.
 
 Поддерживаемые соответствия:
 - Postfix status=sent     -> delivered
@@ -32,13 +32,17 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import time
+from contextlib import closing
+from datetime import datetime
 import re
 from pathlib import Path
 
 from src.database import (
     get_connection,
     initialize_database,
-    record_mail_delivery_status,
 )
 
 
@@ -48,7 +52,7 @@ DEFAULT_MAIL_LOG = Path(
 
 MESSAGE_ID_RE = re.compile(
     r"""
-    (?P<queue_id>[A-F0-9]+):
+    (?P<queue_id>[A-Za-z0-9]+):
     \s+
     message-id=
     (?P<message_id><[^>]+>)
@@ -60,7 +64,7 @@ DELIVERY_RE = re.compile(
     r"""
     postfix/smtp\[\d+\]:
     \s+
-    (?P<queue_id>[A-F0-9]+):
+    (?P<queue_id>[A-Za-z0-9]+):
     \s+
     to=<(?P<recipient>[^>]+)>
     .*?
@@ -111,6 +115,7 @@ def parse_arguments() -> argparse.Namespace:
         ),
     )
 
+    parser.add_argument("--watch", action="store_true", help="Повторять проверку и heartbeat каждые 5 секунд")
     arguments = parser.parse_args()
 
     if (
@@ -297,131 +302,122 @@ def get_messages_for_delivery_check(
     ]
 
 
-def synchronize_delivery_statuses(
-    *,
-    log_path: Path,
-    limit: int | None = None,
-) -> dict[str, int]:
-    """
-    Синхронизировать статусы доставки с SQLite.
+def classify_result(status: str, dsn: str, detail: str) -> str | None:
+    if status == "delivered":
+        return None
+    if status == "deferred" or dsn.startswith("4."):
+        return "temporary_failure"
+    if re.search(r"spam message rejected|(?:reject\w*|block\w*|detected|classified).*\bspam\b|"
+                 r"\bspam\b.*(?:reject\w*|block\w*|detected)|\bunsolicited (?:mail|message)", detail, re.I):
+        return "spam_rejected"
+    if dsn == "5.1.1" or re.search(
+        r"user (?:not found|unknown)|unknown (?:user|recipient)|no such (?:user|mailbox)|"
+        r"recipient (?:not found|does not exist)|mailbox (?:not found|does not exist)", detail, re.I
+    ):
+        return "invalid_recipient"
+    return "other_failure"
 
-    Возвращает краткую статистику текущего запуска.
-    """
-    lines = load_log_lines(
-        log_path
-    )
 
-    message_id_queue_map = (
-        build_message_id_queue_map(
-            lines
-        )
-    )
+def event_timestamp(line: str, reference: float) -> float:
+    first = line.split(" ", 1)[0]
+    try:
+        value = datetime.fromisoformat(first.replace("Z", "+00:00"))
+        return value.timestamp()
+    except ValueError:
+        pass
+    # Traditional syslog timestamps are in the host's local timezone, no year.
+    year = datetime.fromtimestamp(reference).year
+    candidates = []
+    for y in (year - 1, year, year + 1):
+        try:
+            candidates.append(datetime.strptime(f"{y} {line[:15]}", "%Y %b %d %H:%M:%S").timestamp())
+        except ValueError:
+            pass
+    if not candidates:
+        raise ValueError("Postfix event has no valid timestamp")
+    return min(candidates, key=lambda value: abs(value-reference))
 
-    delivery_map = build_delivery_map(
-        lines
-    )
 
-    messages = get_messages_for_delivery_check(
-        limit=limit
-    )
-
-    stats = {
-        "checked": 0,
-        "matched_queue": 0,
-        "delivered": 0,
-        "bounced": 0,
-        "deferred": 0,
-        "not_found": 0,
-    }
-
-    for message in messages:
-        stats["checked"] += 1
-
-        provider_message_id = message[
-            "provider_message_id"
-        ]
-
-        if not isinstance(
-            provider_message_id,
-            str,
-        ):
-            stats["not_found"] += 1
+def synchronize_delivery_statuses(*, log_path: Path, limit: int | None = None) -> dict[str, int]:
+    from src.mailing.control import evaluate, provider_for
+    # Invalidate first. A partial scan/error must never advertise a healthy tail.
+    with closing(get_connection()) as c, c:
+        c.execute("UPDATE mail_control SET heartbeat=NULL WHERE id=1")
+    before = log_path.stat()
+    # Include the immediate rotated file to bridge rotation between polls.
+    rotated = log_path.with_name(log_path.name + ".1")
+    sources = ([rotated] if rotated.is_file() else []) + [log_path]
+    lines = []
+    for source in sources:
+        reference = source.stat().st_mtime
+        lines.extend((line, reference) for line in load_log_lines(source))
+    stats = dict(checked=0, matched_queue=0, delivered=0, bounced=0, deferred=0, not_found=0)
+    with closing(get_connection()) as c, c:
+        for line, reference in lines:
+            match = MESSAGE_ID_RE.search(line)
+            if match:
+                c.execute("INSERT OR IGNORE INTO mail_queue_ids VALUES(?,?,?)", (
+                    match['queue_id'], match['message_id'], event_timestamp(line, reference)))
+    processed = 0
+    deliveries = []
+    for line, reference in lines:
+        match = DELIVERY_RE.search(line)
+        if match is not None:
+            deliveries.append((event_timestamp(line, reference),
+                               hashlib.sha256(line.encode('utf-8')).hexdigest(), line, match))
+    for when, key, line, match in sorted(deliveries, key=lambda item: (item[0], item[1])):
+        with closing(get_connection()) as c:
+            if c.execute("SELECT 1 FROM mail_delivery_events WHERE event_key=?", (key,)).fetchone():
+                continue
+            mapping = c.execute("""SELECT provider_message_id FROM mail_queue_ids
+                WHERE queue_id=? AND event_time<=? ORDER BY event_time DESC LIMIT 1""",
+                (match['queue_id'], when)).fetchone()
+            if not mapping:
+                continue
+            message = c.execute("""SELECT m.*, COALESCE(m.smtp_recipient_email,r.email) AS actual_email
+                FROM mail_messages m JOIN mail_recipients r ON r.id=m.recipient_id
+                WHERE m.provider_message_id=? AND m.is_test=0 AND m.provider='smtp'
+                ORDER BY m.id DESC LIMIT 1""", (mapping[0],)).fetchone()
+        if message is None or message['actual_email'].lower() != match['recipient'].lower():
             continue
-
-        provider_message_id = (
-            provider_message_id.strip()
-        )
-
-        queue_id = (
-            message_id_queue_map.get(
-                provider_message_id
-            )
-        )
-
-        if queue_id is None:
-            stats["not_found"] += 1
-
-            print(
-                f"mail_messages.id={message['id']}: "
-                "queue ID не найден"
-            )
-
-            continue
-
-        stats["matched_queue"] += 1
-
-        delivery = delivery_map.get(
-            queue_id
-        )
-
-        if delivery is None:
-            stats["not_found"] += 1
-
-            print(
-                f"mail_messages.id={message['id']}: "
-                f"queue_id={queue_id}, "
-                "delivery status пока не найден"
-            )
-
-            continue
-
-        delivery_status = str(
-            delivery[
-                "delivery_status"
-            ]
-        )
-
-        saved = record_mail_delivery_status(
-            provider_message_id=provider_message_id,
-            delivery_status=delivery_status,
-            queue_id=queue_id,
-            dsn=str(
-                delivery["dsn"]
-            ),
-            detail=str(
-                delivery["detail"]
-            ),
-        )
-
-        if not saved:
-            print(
-                f"mail_messages.id={message['id']}: "
-                "статус найден, но запись в БД "
-                "не выполнена"
-            )
-
-            continue
-
-        stats[delivery_status] += 1
-
-        print(
-            f"mail_messages.id={message['id']}: "
-            f"{delivery_status} "
-            f"(queue={queue_id}, "
-            f"dsn={delivery['dsn']}, "
-            f"to={delivery['recipient']})"
-        )
-
+        if limit is not None and processed >= limit:
+            # A deliberately limited scan cannot provide a healthy heartbeat.
+            return stats
+        processed += 1
+        provider = message['mx_provider'] or provider_for(message['actual_email'])
+        if not provider:
+            raise RuntimeError('Cannot resolve provider for delivery event')
+        status = POSTFIX_STATUS_MAP[match['status']]
+        detail = (match['detail'] or '').removeprefix('(').removesuffix(')')
+        reason = classify_result(status, match['dsn'], detail)
+        relay = re.search(r"\brelay=([^,\s]+)", line)
+        with closing(get_connection()) as c, c:
+            c.execute('BEGIN IMMEDIATE')
+            inserted = c.execute("""INSERT OR IGNORE INTO mail_delivery_events
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (key, message['id'], match['recipient'],
+                match['queue_id'], when, status, reason, match['dsn'],
+                relay[1] if relay else '', detail, line)).rowcount
+            if not inserted:
+                continue
+            # Legacy messages are retained, but cannot enter a new observation period.
+            c.execute("UPDATE mail_messages SET mx_provider=? WHERE id=?", (provider, message['id']))
+            final = c.execute("""SELECT * FROM mail_delivery_events WHERE message_id=?
+                ORDER BY CASE WHEN status IN ('delivered','bounced') THEN 0 ELSE 1 END,
+                event_time,event_key LIMIT 1""", (message['id'],)).fetchone()
+            c.execute("UPDATE mail_messages SET delivery_status=?,result_reason=? WHERE id=?",
+                      (final['status'], final['reason'], message['id']))
+            c.execute("INSERT INTO mail_events(message_id,event_type,event_data) VALUES(?,?,?)",
+                      (message['id'], status, json.dumps(dict(queue_id=match['queue_id'],
+                       dsn=match['dsn'], detail=detail, relay=relay[1] if relay else '',
+                       event_time=when, reason=reason), ensure_ascii=False)))
+            evaluate(c, provider, time.time())
+        stats['checked'] += 1
+        stats['matched_queue'] += 1
+        stats[status] += 1
+    after = log_path.stat()
+    if (before.st_ino, before.st_size, before.st_mtime_ns) == (after.st_ino, after.st_size, after.st_mtime_ns):
+        with closing(get_connection()) as c, c:
+            c.execute("UPDATE mail_control SET heartbeat=? WHERE id=1", (time.time(),))
     return stats
 
 
@@ -432,33 +428,12 @@ def main() -> None:
     arguments = parse_arguments()
     initialize_database()
 
-    stats = synchronize_delivery_statuses(
-        log_path=arguments.log,
-        limit=arguments.limit,
-    )
-
-    print()
-    print("Postfix delivery sync завершён.")
-    print(
-        f"Проверено: {stats['checked']}"
-    )
-    print(
-        f"Queue ID найден: "
-        f"{stats['matched_queue']}"
-    )
-    print(
-        f"Delivered: {stats['delivered']}"
-    )
-    print(
-        f"Bounced: {stats['bounced']}"
-    )
-    print(
-        f"Deferred: {stats['deferred']}"
-    )
-    print(
-        f"Без результата: "
-        f"{stats['not_found']}"
-    )
+    while True:
+        stats = synchronize_delivery_statuses(log_path=arguments.log, limit=arguments.limit)
+        print("Postfix delivery sync:", stats, flush=True)
+        if not arguments.watch:
+            break
+        time.sleep(5)
 
 
 if __name__ == "__main__":

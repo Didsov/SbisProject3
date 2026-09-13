@@ -74,6 +74,7 @@ class MailMessage:
     html_body: str
     attachments: list[MailAttachment] | None = None
     include_logo: bool = True
+    provider_message_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -537,7 +538,7 @@ async def run_sender(
 
     recipients = get_pending_mail_recipients(
         campaign_id=campaign_id,
-        limit=limit,
+        limit=None if smtp_send and not test_emails else limit,
     )
 
     if not recipients:
@@ -558,6 +559,32 @@ async def run_sender(
     print(
         f"Получателей в текущем запуске: {len(recipients)}"
     )
+
+    if smtp_send and not test_emails and not tracking_test:
+        import asyncio
+        from src.mailing.control import dispatch
+        remaining = recipients
+        while remaining and limit > 0:
+            waiting = []
+            for recipient in remaining:
+                result, reason = await dispatch(
+                    recipient,
+                    lambda token: build_mail_message(recipient, template, tracking_token=token),
+                    provider, run_id=run_id,
+                )
+                print(f"recipient_id={recipient['recipient_id']} -> {reason}")
+                if result is not None:
+                    limit -= 1
+                    if limit <= 0:
+                        return
+                if reason in {'log_heartbeat_stale', 'uncertain_handoff', 'manual_pause', 'daily_limit', 'sender_busy'}:
+                    return
+                if reason in {'waiting_mx', 'deferred', 'mx_lookup_failed'}:
+                    waiting.append(recipient)
+            remaining = waiting
+            if remaining:
+                await asyncio.sleep(5)
+        return
 
     for index, recipient in enumerate(
         recipients,

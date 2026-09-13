@@ -1,0 +1,14 @@
+[Unit]
+Description=ProjectSbis Postfix delivery feedback and heartbeat
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/projectsbis/repository
+EnvironmentFile=/etc/projectsbis/projectsbis.env
+ExecStart=/opt/projectsbis/repository/.venv/bin/python -m src.mailing.postfix_delivery --watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

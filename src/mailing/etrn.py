@@ -6,7 +6,6 @@ import argparse
 import asyncio
 import json
 import os
-import random
 import re
 from contextlib import closing
 from dataclasses import asdict, dataclass, replace
@@ -16,9 +15,7 @@ from pathlib import Path
 from src.client_loader import load_clients_by_inn, request_with_network_retries
 from src.config import PROJECT_ROOT
 from src.database import (
-    complete_mail_message,
     create_mail_batch_run,
-    create_mail_message,
     finish_mail_run,
     get_connection,
     get_mail_campaign,
@@ -446,31 +443,6 @@ def _eligible_recipients(
     return [dict(row) for row in rows]
 
 
-def _campaign_cooldown(campaign_id: int) -> datetime | None:
-    campaign = get_mail_campaign(campaign_id)
-    raw = campaign.get("next_send_at")
-    if not raw:
-        return None
-    value = datetime.strptime(str(raw), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-    return value if value > datetime.now(timezone.utc) else None
-
-
-def _report_active_cooldown(campaign_id: int) -> bool:
-    cooldown = _campaign_cooldown(campaign_id)
-    if cooldown is None:
-        return False
-    remaining = max(
-        1,
-        int((cooldown - datetime.now(timezone.utc)).total_seconds()) + 1,
-    )
-    print(
-        "ETRN_COOLDOWN_ACTIVE\n"
-        f"next_send_at={cooldown.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"remaining_seconds={remaining}"
-    )
-    return True
-
-
 def _pending_queue_count(campaign_id: int) -> int:
     with closing(get_connection()) as connection, connection:
         return int(connection.execute(
@@ -545,19 +517,6 @@ def _record_attempt(recipient_id: int, attempts: int, error: str | None = None) 
         )
 
 
-def _set_cooldown(campaign_id: int, duration: int) -> datetime:
-    until = datetime.now(timezone.utc) + timedelta(seconds=duration)
-    with closing(get_connection()) as connection, connection:
-        connection.execute(
-            """
-            UPDATE mail_campaigns SET next_send_at = ?,
-                updated_at = CURRENT_TIMESTAMP WHERE id = ?
-            """,
-            (until.strftime("%Y-%m-%d %H:%M:%S"), campaign_id),
-        )
-    return until
-
-
 def _clear_cooldown(campaign_id: int) -> None:
     with closing(get_connection()) as connection, connection:
         connection.execute(
@@ -569,15 +528,17 @@ def _clear_cooldown(campaign_id: int) -> None:
         )
 
 
-def _cooldown_duration() -> int:
-    minimum = _env_int("ETRN_COOLDOWN_MIN_SECONDS", 2400)
-    maximum = _env_int("ETRN_COOLDOWN_MAX_SECONDS", 3000)
-    if maximum < minimum:
-        raise ValueError("Максимальный ETRN cooldown меньше минимального")
-    return random.randint(minimum, maximum)
-
-
 async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
+    from src import database
+    from src.daily_lock import daily_run_lock
+    if dry_run:
+        await _send_campaign_locked(dry_run=True, confirm_real_send=confirm_real_send)
+        return
+    with daily_run_lock(database.DATABASE_FILE.with_suffix('.etrn-worker.lock')):
+        await _send_campaign_locked(dry_run=False, confirm_real_send=confirm_real_send)
+
+
+async def _send_campaign_locked(*, dry_run: bool, confirm_real_send: bool) -> None:
     if not dry_run and not confirm_real_send:
         raise ValueError("Для реальной отправки требуется --confirm-real-send")
     batch_size = get_batch_limit()
@@ -591,8 +552,6 @@ async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
         )
     initialize_database()
     campaign_id = ensure_etrn_campaign()
-    if not dry_run and _report_active_cooldown(campaign_id):
-        return
     attachments = [] if disable_attachments else load_attachments()
     template = get_mail_template(TEMPLATE_NAME)
     if dry_run:
@@ -620,18 +579,11 @@ async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
         _env_int("ETRN_RETRY_FIRST_SECONDS", 60),
         _env_int("ETRN_RETRY_SECOND_SECONDS", 300),
     )
-    jitter_min = _env_int("ETRN_MESSAGE_DELAY_MIN_SECONDS", 6)
-    jitter_max = _env_int("ETRN_MESSAGE_DELAY_MAX_SECONDS", 8)
-    if jitter_max < jitter_min:
-        raise ValueError("Максимальный ETRN jitter меньше минимального")
-    recovered_runs = _recover_interrupted_runs(campaign_id)
-    if recovered_runs and _pending_queue_count(campaign_id) and not _campaign_cooldown(campaign_id):
-        _set_cooldown(campaign_id, _cooldown_duration())
-    if _report_active_cooldown(campaign_id):
-        return
+    from src.mailing.control import dispatch
+    _recover_interrupted_runs(campaign_id)
 
     while True:
-        recipients = _eligible_recipients(campaign_id, batch_size)
+        recipients = _eligible_recipients(campaign_id, 2147483647)
         if not recipients:
             if _pending_queue_count(campaign_id) == 0:
                 _clear_cooldown(campaign_id)
@@ -672,6 +624,7 @@ async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
             f"run_id={run_id}\nsize={len(recipients)}"
         )
         sent = failed = deferred = 0
+        retry_feedback = False
         try:
             for index, recipient in enumerate(recipients, 1):
                 real_email = normalize_email(str(recipient["email"]))
@@ -680,38 +633,34 @@ async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
                     if test_config.enabled
                     else real_email
                 )
-                record = create_mail_message(
-                    recipient_id=int(recipient["recipient_id"]),
-                    provider="smtp",
-                    run_id=run_id,
-                    smtp_recipient_email=smtp_email,
-                    is_test_recipient=test_config.enabled,
+                def build(token):
+                    message = build_mail_message(recipient, template, tracking_token=token)
+                    message.attachments = attachments
+                    return replace(message, to_email=smtp_email)
+
+                result, reason = await dispatch(
+                    recipient, build, provider, run_id=run_id,
+                    smtp_email=smtp_email, is_test_recipient=test_config.enabled,
                 )
-                message: MailMessage = build_mail_message(
-                    recipient,
-                    template,
-                    tracking_token=str(record["tracking_token"]),
-                )
-                message.attachments = attachments
-                outbound_message = replace(message, to_email=smtp_email)
-                result = await provider.send(outbound_message)
-                complete_mail_message(
-                    message_id=int(record["message_id"]),
-                    provider_message_id=result.provider_message_id,
-                    success=result.success,
-                    error=result.error,
-                )
+                if result is None:
+                    print(f"recipient_id={recipient['recipient_id']} -> {reason}")
+                    if reason in {'log_heartbeat_stale', 'uncertain_handoff', 'manual_pause', 'daily_limit', 'sender_busy'}:
+                        retry_feedback = False
+                        break
+                    retry_feedback |= reason in {'waiting_mx', 'deferred', 'mx_lookup_failed'}
+                    continue
+                recipient_id = int(recipient['recipient_id'])
                 attempts = int(recipient.get("attempt_count") or 0) + 1
                 if result.success:
                     sent += 1
-                    _record_attempt(message.recipient_id, attempts)
+                    _record_attempt(recipient_id, attempts)
                     outcome = "sent"
                 else:
                     error = result.error or "SMTP error"
                     if attempts < 3 and TRANSIENT_ERROR_RE.search(error):
                         deferred += 1
                         _defer_recipient(
-                            message.recipient_id,
+                            recipient_id,
                             attempts,
                             error,
                             retry_delays[attempts - 1],
@@ -719,14 +668,12 @@ async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
                         outcome = "deferred"
                     else:
                         failed += 1
-                        _record_attempt(message.recipient_id, attempts, error)
+                        _record_attempt(recipient_id, attempts, error)
                         outcome = "failed"
                 print(
                     f"[{index}/{len(recipients)}] "
-                    f"recipient_id={message.recipient_id} -> {outcome}"
+                    f"recipient_id={recipient_id} -> {outcome}"
                 )
-                if index < len(recipients):
-                    await asyncio.sleep(random.randint(jitter_min, jitter_max))
         except BaseException as error:
             finish_mail_run(
                 run_id,
@@ -741,13 +688,11 @@ async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
             )
             pending_count = _pending_queue_count(campaign_id)
             set_mail_run_pending_count(run_id, pending_count)
-            if pending_count:
-                _set_cooldown(campaign_id, _cooldown_duration())
             raise
 
         finish_mail_run(
             run_id,
-            status="success" if not failed and not deferred else "partial",
+            status="success" if sent == len(recipients) else "partial",
             recipients_added=len(recipients),
             sent_count=sent,
             delivered_count=0,
@@ -765,10 +710,11 @@ async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
         if pending_count == 0:
             _clear_cooldown(campaign_id)
             return
-        duration = _cooldown_duration()
-        until = _set_cooldown(campaign_id, duration)
-        print(f"ETRN_COOLDOWN_SET\nduration={duration}s\nuntil={until.isoformat()}")
+        if retry_feedback:
+            await asyncio.sleep(5)
+            continue
         return
+
 
 
 def campaign_stats() -> dict[str, int]:

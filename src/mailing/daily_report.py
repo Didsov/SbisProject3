@@ -472,6 +472,12 @@ async def send_daily_report(
         details_url=details_url,
     )
 
+    from html import escape
+    from src.mailing.control import report_summary
+    control_summary = report_summary()
+    text_body += "\n\n" + control_summary
+    html_body = html_body.replace("</body>", "<pre>" + escape(control_summary) + "</pre></body>")
+
     xlsx_bytes = build_xlsx_report(
         rows
     )

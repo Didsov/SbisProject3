@@ -1,3 +1,4 @@
 aiohttp
 python-dotenv
 openpyxl
+dnspython>=2.6,<3

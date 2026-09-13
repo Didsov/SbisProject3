@@ -119,6 +119,7 @@ class SMTPSendResult:
     success: bool
     provider_message_id: str | None
     error: str | None = None
+    uncertain: bool = False
 
 
 class SMTPMailProvider:
@@ -284,7 +285,7 @@ class SMTPMailProvider:
         """
         email_message = EmailMessage()
 
-        message_id = make_msgid(
+        message_id = getattr(message, 'provider_message_id', None) or make_msgid(
             domain="projectsbis.ru"
         )
 
@@ -352,6 +353,8 @@ class SMTPMailProvider:
                 )
 
         tls_context = ssl.create_default_context()
+        submitting = False
+        accepted = False
 
         try:
             with smtplib.SMTP(
@@ -373,21 +376,30 @@ class SMTPMailProvider:
                     self.password,
                 )
 
+                submitting = True
                 smtp.send_message(
                     email_message,
                     from_addr=self.from_email,
                     to_addrs=[message.to_email],
                 )
+                submitting = False
+                accepted = True
 
         except (
             smtplib.SMTPException,
             OSError,
             ssl.SSLError,
         ) as error:
+            if accepted:
+                return SMTPSendResult(success=True, provider_message_id=message_id)
             return SMTPSendResult(
                 success=False,
                 provider_message_id=None,
                 error=str(error),
+                uncertain=submitting and not isinstance(error, (
+                    smtplib.SMTPRecipientsRefused, smtplib.SMTPDataError,
+                    smtplib.SMTPSenderRefused,
+                )),
             )
 
         return SMTPSendResult(

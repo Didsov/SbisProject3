@@ -1480,6 +1480,10 @@ def initialize_mailing_tables(
     )
 
 
+    from src.mailing.control import initialize_control_tables
+    initialize_control_tables(connection)
+
+
 def get_or_create_mail_campaign(
     *,
     name: str,

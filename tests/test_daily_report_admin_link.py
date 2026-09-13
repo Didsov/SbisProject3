@@ -92,10 +92,11 @@ class DailyReportAdminLinkTestCase(unittest.IsolatedAsyncioTestCase):
                 return_value=provider,
             ),
         ):
-            await daily_report.send_daily_report(
-                3,
-                run_id=17,
-            )
+            with patch('src.mailing.control.report_summary', return_value='Queue control status'):
+                await daily_report.send_daily_report(
+                    3,
+                    run_id=17,
+                )
 
         message = provider.send.await_args.args[0]
         expected_url = (
