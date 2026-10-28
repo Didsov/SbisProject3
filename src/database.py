@@ -23,7 +23,7 @@
 
 from __future__ import annotations
 
-from contextlib import closing
+from contextlib import closing, contextmanager, nullcontext
 import json
 import os
 import sqlite3
@@ -1025,6 +1025,7 @@ def initialize_mailing_tables(
 
             normalized_email TEXT,
             campaign_family TEXT,
+            contact_name TEXT,
             attempt_count INTEGER NOT NULL DEFAULT 0,
             next_attempt_at TEXT,
             last_error TEXT,
@@ -1063,6 +1064,7 @@ def initialize_mailing_tables(
     for column_name, definition in {
         "normalized_email": "TEXT",
         "campaign_family": "TEXT",
+        "contact_name": "TEXT",
         "attempt_count": "INTEGER NOT NULL DEFAULT 0",
         "next_attempt_at": "TEXT",
         "last_error": "TEXT",
@@ -1405,6 +1407,13 @@ def initialize_mailing_tables(
         CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_recipients_etrn_email
         ON mail_recipients(campaign_family, normalized_email)
         WHERE campaign_family = 'etrn' AND normalized_email IS NOT NULL
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_recipients_manual_email
+        ON mail_recipients(campaign_id, normalized_email)
+        WHERE campaign_family = 'manual' AND normalized_email IS NOT NULL
         """
     )
 
@@ -1891,12 +1900,21 @@ def get_pending_mail_recipients(
         SELECT
             mr.id AS recipient_id,
             mr.client_id,
-            c.name,
+            COALESCE(NULLIF(mr.contact_name, ''), c.name) AS name,
             c.inn,
             mr.email,
             mr.status,
-            c.director_first_name,
-            c.director_middle_name
+            CASE
+                WHEN NULLIF(mr.contact_name, '') IS NOT NULL
+                THEN mr.contact_name
+                ELSE c.director_first_name
+            END AS director_first_name,
+            CASE
+                WHEN NULLIF(mr.contact_name, '') IS NOT NULL
+                THEN ''
+                ELSE c.director_middle_name
+            END AS director_middle_name,
+            mr.contact_name
         FROM mail_recipients AS mr
 
         INNER JOIN clients AS c
@@ -3243,6 +3261,13 @@ def get_mail_message_timeline(
     ]
 
 
+@contextmanager
+def _mail_message_transaction():
+    with closing(get_connection()) as connection, connection:
+        connection.execute('BEGIN IMMEDIATE')
+        yield connection
+
+
 def create_mail_message(
     *,
     recipient_id: int,
@@ -3251,6 +3276,7 @@ def create_mail_message(
     run_id: int | None = None,
     smtp_recipient_email: str | None = None,
     is_test_recipient: bool = False,
+    connection: sqlite3.Connection | None = None,
 ) -> dict:
     """
     Создать попытку отправки письма до обращения к SMTP.
@@ -3330,7 +3356,7 @@ def create_mail_message(
 
     tracking_token = secrets.token_urlsafe(24)
 
-    with get_connection() as connection:
+    with (nullcontext(connection) if connection is not None else _mail_message_transaction()) as connection:
         recipient = connection.execute(
             """
             SELECT
@@ -3354,6 +3380,12 @@ def create_mail_message(
                 f"Получатель #{recipient_id} имеет статус "
                 f"{recipient_status!r}, ожидался 'pending'"
             )
+
+        if not is_test and connection.execute(
+            "SELECT 1 FROM mail_messages WHERE recipient_id=? AND is_test=0 "
+            "AND status IN ('pending','sent') LIMIT 1", (recipient_id,),
+        ).fetchone():
+            raise ValueError('Recipient already has a pending or accepted SMTP attempt')
 
         cursor = connection.execute(
             """

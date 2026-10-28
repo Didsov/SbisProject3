@@ -534,7 +534,7 @@ async def send_campaign(*, dry_run: bool, confirm_real_send: bool) -> None:
     if dry_run:
         await _send_campaign_locked(dry_run=True, confirm_real_send=confirm_real_send)
         return
-    with daily_run_lock(database.DATABASE_FILE.with_suffix('.etrn-worker.lock')):
+    with daily_run_lock(database.DATABASE_FILE.resolve().with_suffix('.etrn-worker.lock')):
         await _send_campaign_locked(dry_run=False, confirm_real_send=confirm_real_send)
 
 
@@ -644,7 +644,7 @@ async def _send_campaign_locked(*, dry_run: bool, confirm_real_send: bool) -> No
                 )
                 if result is None:
                     print(f"recipient_id={recipient['recipient_id']} -> {reason}")
-                    if reason in {'log_heartbeat_stale', 'uncertain_handoff', 'manual_pause', 'daily_limit', 'sender_busy'}:
+                    if reason in {'log_heartbeat_stale', 'uncertain_handoff', 'manual_pause', 'daily_limit', 'sender_busy', 'legacy_feedback_pending'}:
                         retry_feedback = False
                         break
                     retry_feedback |= reason in {'waiting_mx', 'deferred', 'mx_lookup_failed'}

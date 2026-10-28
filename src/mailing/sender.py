@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from uuid import uuid4
+from typing import Callable
 from src.config import TEST_MAIL_EMAIL
 
 from src.mailing.smtp_provider import MailAttachment, SMTPMailProvider
@@ -75,6 +76,7 @@ class MailMessage:
     attachments: list[MailAttachment] | None = None
     include_logo: bool = True
     provider_message_id: str | None = None
+    before_smtp: Callable[[], None] | None = None
 
 
 @dataclass(slots=True)
@@ -577,7 +579,7 @@ async def run_sender(
                     limit -= 1
                     if limit <= 0:
                         return
-                if reason in {'log_heartbeat_stale', 'uncertain_handoff', 'manual_pause', 'daily_limit', 'sender_busy'}:
+                if reason in {'log_heartbeat_stale', 'uncertain_handoff', 'manual_pause', 'daily_limit', 'sender_busy', 'legacy_feedback_pending'}:
                     return
                 if reason in {'waiting_mx', 'deferred', 'mx_lookup_failed'}:
                     waiting.append(recipient)

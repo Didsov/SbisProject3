@@ -46,10 +46,22 @@ def initialize_control_tables(c):
         """CREATE TABLE IF NOT EXISTS mail_queue_ids (
             queue_id TEXT NOT NULL, provider_message_id TEXT NOT NULL,
             event_time REAL NOT NULL, PRIMARY KEY(queue_id, event_time))""",
+        """CREATE TABLE IF NOT EXISTS mail_queue_links (
+            queue_id TEXT NOT NULL, provider_message_id TEXT NOT NULL,
+            event_time REAL NOT NULL,
+            PRIMARY KEY(queue_id,event_time,provider_message_id))""",
     ):
         c.execute(statement)
-    c.execute("INSERT OR IGNORE INTO mail_control(id,settings) VALUES(1,?)",
+    c.execute('INSERT OR IGNORE INTO mail_queue_links SELECT * FROM mail_queue_ids')
+    c.execute("INSERT OR IGNORE INTO mail_control(id,settings,paused) VALUES(1,?,1)",
               (json.dumps(DEFAULTS),))
+    control_columns = {r[1] for r in c.execute('PRAGMA table_info(mail_control)')}
+    for name, kind in (('safety_revision', 'INTEGER NOT NULL DEFAULT 0'),
+                       ('log_path', 'TEXT'), ('log_checkpoint', 'TEXT')):
+        if name not in control_columns:
+            c.execute(f'ALTER TABLE mail_control ADD COLUMN {name} {kind}')
+    # Installing the safety revision must not silently admit the old queue.
+    c.execute('UPDATE mail_control SET paused=1,heartbeat=NULL,safety_revision=1 WHERE safety_revision<1')
     columns = {r[1] for r in c.execute("PRAGMA table_info(mail_messages)")}
     for name, kind in (("mx_provider", "TEXT"), ("observation_period", "INTEGER"),
                        ("handoff_at", "REAL"), ("result_reason", "TEXT")):
@@ -150,13 +162,17 @@ def evaluate(c, provider, now):
     return 'active'
 
 
-def blocked(c, provider, now):
+def blocked(c, provider, now, *, active_message=None):
     cfg = settings(c)
     state = c.execute("SELECT * FROM mail_control WHERE id=1").fetchone()
     if state['paused']:
         return 'manual_pause', 0
-    if state['active_message'] is not None:
+    if state['active_message'] is not None and state['active_message'] != active_message:
         return 'uncertain_handoff', 0
+    if c.execute("""SELECT 1 FROM mail_messages WHERE provider='smtp' AND is_test=0
+        AND status='sent' AND delivery_status IN ('unknown','deferred')
+        AND mx_provider IS NULL LIMIT 1""").fetchone():
+        return 'legacy_feedback_pending', 0
     if state['heartbeat'] is None or not 0 <= now-state['heartbeat'] <= cfg['heartbeat_timeout']:
         return 'log_heartbeat_stale', 0
     if evaluate(c, provider, now) != 'active':
@@ -165,16 +181,20 @@ def blocked(c, provider, now):
         delivery_status='deferred' LIMIT 1""", (provider,)).fetchone():
         return 'deferred', 0
     unanswered = c.execute("""SELECT COUNT(*) FROM mail_messages m WHERE mx_provider=?
-        AND handoff_at IS NOT NULL AND status IN ('pending','sent')
+        AND (handoff_at IS NOT NULL OR status='sent') AND status IN ('pending','sent')
+        AND delivery_status='unknown' AND id != ?
         AND NOT EXISTS(SELECT 1 FROM mail_delivery_events e WHERE e.message_id=m.id)""",
-        (provider,)).fetchone()[0]
+        (provider, active_message or -1)).fetchone()[0]
     if unanswered >= cfg['max_unanswered']:
         return 'waiting_mx', 0
     count = c.execute("""SELECT COUNT(*) FROM mail_messages WHERE is_test=0 AND provider='smtp'
+        AND id != ?
         AND (handoff_at>=? OR (handoff_at IS NULL AND sent_at>=datetime(?,'unixepoch')))""",
-        (now - now % 86400, now - now % 86400)).fetchone()[0]
+        (active_message or -1, now - now % 86400, now - now % 86400)).fetchone()[0]
     if count >= cfg['daily_limit']:
         return 'daily_limit', 0
+    if active_message is not None:
+        return None, 0  # This message already owns the reserved interval.
     last = c.execute("SELECT last_handoff FROM mail_providers WHERE provider=?", (provider,)).fetchone()[0]
     delay = max(0, (state['last_handoff'] or 0)+cfg['global_interval']-now,
                 (last or 0)+cfg['provider_interval']-now)
@@ -193,7 +213,7 @@ async def dispatch(recipient, build, transport, *, run_id=None, smtp_email=None,
         return None, 'mx_lookup_failed'
     while True:
         try:
-            with daily_run_lock(db.DATABASE_FILE.with_suffix('.mail-send.lock')):
+            with daily_run_lock(db.DATABASE_FILE.resolve().with_suffix('.mail-send.lock')):
                 with closing(db.get_connection()) as c, c:
                     c.execute('BEGIN IMMEDIATE')
                     c.execute('UPDATE mail_recipients SET mx_provider=? WHERE id=?',
@@ -207,14 +227,32 @@ async def dispatch(recipient, build, transport, *, run_id=None, smtp_email=None,
                         (recipient['recipient_id'],)).fetchone()
                     if row is None or row[0] != 'pending' or attempted:
                         return None, 'already_claimed'
+                    if not reason:
+                        record = db.create_mail_message(recipient_id=recipient['recipient_id'],
+                            provider='smtp', run_id=run_id, smtp_recipient_email=smtp_email,
+                            is_test_recipient=is_test_recipient, connection=c)
                 if reason and reason != 'interval':
                     return None, reason
                 if not reason:
-                    record = db.create_mail_message(recipient_id=recipient['recipient_id'],
-                        provider='smtp', run_id=run_id, smtp_recipient_email=smtp_email,
-                        is_test_recipient=is_test_recipient)
-                    message = build(record['tracking_token'])
+                    try:
+                        message = build(record['tracking_token'])
+                    except BaseException:
+                        with closing(db.get_connection()) as c, c:
+                            c.execute('DELETE FROM mail_messages WHERE id=? AND handoff_at IS NULL', (record['message_id'],))
+                        raise
                     message.provider_message_id = make_msgid(domain='projectsbis.ru')
+                    from src.mailing.smtp_provider import SMTPHandoffBlocked
+                    def before_smtp():
+                        with closing(db.get_connection()) as c, c:
+                            c.execute('BEGIN IMMEDIATE')
+                            reason, _ = blocked(c, provider, clock(), active_message=record['message_id'])
+                            if not reason:
+                                c.execute('UPDATE mail_messages SET handoff_at=? WHERE id=?', (clock(), record['message_id']))
+                                c.execute('UPDATE mail_control SET last_handoff=? WHERE id=1', (clock(),))
+                                c.execute('UPDATE mail_providers SET last_handoff=? WHERE provider=?', (clock(), provider))
+                        if reason:
+                            raise SMTPHandoffBlocked(reason)
+                    message.before_smtp = before_smtp
                     with closing(db.get_connection()) as c, c:
                         c.execute('BEGIN IMMEDIATE')
                         # Results can arrive while the message is being built.
@@ -229,9 +267,29 @@ async def dispatch(recipient, build, transport, *, run_id=None, smtp_email=None,
                         c.execute('UPDATE mail_control SET active_message=?,last_handoff=? WHERE id=1',
                                   (record['message_id'], clock()))
                         c.execute('UPDATE mail_providers SET last_handoff=? WHERE provider=?', (clock(), provider))
-                    result = await transport.send(message)
+                    sending = asyncio.create_task(transport.send(message))
+                    cancelled = False
+                    while True:
+                        try:
+                            result = await asyncio.shield(sending)
+                            break
+                        except asyncio.CancelledError:
+                            cancelled = True
+                            if sending.cancelled():
+                                raise
+                            # to_thread cannot be stopped by cancelling its awaiter.
+                            # Keep the OS lock until the actual SMTP operation ends.
+                        except SMTPHandoffBlocked as error:
+                            with closing(db.get_connection()) as c, c:
+                                c.execute('DELETE FROM mail_messages WHERE id=?', (record['message_id'],))
+                                c.execute('UPDATE mail_control SET active_message=NULL WHERE id=1')
+                            if cancelled:
+                                raise asyncio.CancelledError
+                            return None, str(error)
                     if getattr(result, 'uncertain', False):
                         log.error('MAILING uncertain_handoff message_id=%s', record['message_id'])
+                        if cancelled:
+                            raise asyncio.CancelledError
                         return None, 'uncertain_handoff'
                     db.complete_mail_message(message_id=record['message_id'],
                         provider_message_id=result.provider_message_id or message.provider_message_id,
@@ -239,6 +297,8 @@ async def dispatch(recipient, build, transport, *, run_id=None, smtp_email=None,
                     with closing(db.get_connection()) as c, c:
                         c.execute('UPDATE mail_control SET active_message=NULL,last_handoff=? WHERE id=1', (clock(),))
                         c.execute('UPDATE mail_providers SET last_handoff=? WHERE provider=?', (clock(), provider))
+                    if cancelled:
+                        raise asyncio.CancelledError
                     return result, 'sent' if result.success else 'failed'
         except DailyRunAlreadyRunningError:
             return None, 'sender_busy'
@@ -258,7 +318,7 @@ def status():
             (SELECT COUNT(*) FROM mail_messages m WHERE m.mx_provider=p.provider
              AND m.delivery_status='deferred') AS deferred_deliveries,
             (SELECT COUNT(*) FROM mail_messages m WHERE m.mx_provider=p.provider
-             AND m.handoff_at IS NOT NULL AND m.status IN ('pending','sent')
+             AND (m.handoff_at IS NOT NULL OR m.status='sent') AND m.status IN ('pending','sent')
              AND m.delivery_status NOT IN ('delivered','bounced')) AS awaiting_final
             FROM mail_provider_periods p JOIN mail_providers current ON current.period_id=p.id""")]
         control['not_handed_off'] = c.execute("""SELECT COUNT(*) FROM mail_recipients r
@@ -266,6 +326,8 @@ def status():
                 WHERE m.recipient_id=r.id AND m.is_test=0 AND m.status IN ('pending','sent'))""").fetchone()[0]
         control['unresolved_provider'] = c.execute("SELECT COUNT(*) FROM mail_recipients WHERE mx_provider IS NULL AND status='pending'").fetchone()[0]
         control['heartbeat_age'] = None if control['heartbeat'] is None else time.time()-control['heartbeat']
+        control['feedback_healthy'] = (control['heartbeat_age'] is not None and
+            0 <= control['heartbeat_age'] <= control['settings']['heartbeat_timeout'])
         return control
 
 
@@ -281,7 +343,7 @@ def report_summary():
 
 
 def manage(action, provider=None, changes=None):
-    with daily_run_lock(db.DATABASE_FILE.with_suffix('.mail-send.lock')):
+    with daily_run_lock(db.DATABASE_FILE.resolve().with_suffix('.mail-send.lock')):
         with closing(db.get_connection()) as c, c:
             c.execute('BEGIN IMMEDIATE')
             now = time.time()
@@ -297,7 +359,7 @@ def manage(action, provider=None, changes=None):
             elif provider:
                 period = ensure_provider(c, provider, now)
                 if action == 'pause':
-                    c.execute("UPDATE mail_provider_periods SET state='paused_manual',reason='operator',paused_at=? WHERE id=?", (now, period))
+                    c.execute("UPDATE mail_provider_periods SET state='paused_manual',reason='operator',paused_at=? WHERE id=? AND state='active'", (now, period))
                 elif action == 'resume':
                     c.execute('UPDATE mail_provider_periods SET ended=? WHERE id=?', (now, period))
                     new = c.execute('INSERT INTO mail_provider_periods(provider,started) VALUES(?,?)', (provider, now)).lastrowid

@@ -22,6 +22,7 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         self.patch = patch.object(db, 'DATABASE_FILE', self.root / 'test.db')
         self.patch.start()
         db.initialize_database()
+        control.manage('resume')
         self.now = time.time()
         self.heartbeat()
         self.campaign = etrn.ensure_etrn_campaign()
@@ -269,7 +270,8 @@ assert result == (None, 'sender_busy'), result
         with closing(db.get_connection()) as c:
             self.assertIsNotNone(c.execute('SELECT heartbeat FROM mail_control').fetchone()[0])
         with self.assertRaises(FileNotFoundError):
-            logs.synchronize_delivery_statuses(log_path=self.root / 'missing')
+            (self.root / 'mail.log').unlink()
+            logs.synchronize_delivery_statuses(log_path=self.root / 'mail.log')
         self.assertEqual((await self.dispatch())[1], 'log_heartbeat_stale')
 
     def test_classification(self):
@@ -338,6 +340,214 @@ assert result == (None, 'sender_busy'), result
             self.assertEqual(control.provider_for('a@adapter.test'), 'gmail')
             resolver.assert_called_once_with('adapter.test', 'MX', lifetime=5)
         self.provider_patch.start()
+
+
+    async def test_cancel_keeps_lock_until_smtp_thread_has_finished(self):
+        import threading
+        entered = threading.Event()
+        finish = threading.Event()
+        class ThreadSMTP:
+            async def send(self, message):
+                def submit():
+                    entered.set()
+                    if not finish.wait(10):
+                        raise RuntimeError('Test synchronization timed out')
+                    return SMTPSendResult(True, message.provider_message_id)
+                return await asyncio.to_thread(submit)
+        task = asyncio.create_task(self.dispatch(transport=ThreadSMTP()))
+        try:
+            await asyncio.to_thread(entered.wait, 5)
+            self.assertTrue(entered.is_set())
+            task.cancel()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            with self.assertRaises(control.DailyRunAlreadyRunningError):
+                control.manage('acknowledge-handoff')
+        finally:
+            finish.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertIsNone(control.status()['active_message'])
+        with closing(db.get_connection()) as c:
+            self.assertEqual(c.execute('SELECT status FROM mail_messages').fetchone()[0], 'sent')
+
+    async def test_build_failure_does_not_strand_unsent_recipient(self):
+        r = self.recipient()
+        def fail(_):
+            raise ValueError('template failed')
+        with self.assertRaises(ValueError):
+            await control.dispatch(r, fail, self, clock=lambda: self.now, sleep=self.sleep)
+        self.assertIsNotNone((await self.dispatch(r))[0])
+
+    async def test_smtp_login_delay_rechecks_feedback_before_data(self):
+        from src.mailing.smtp_provider import SMTPMailProvider
+        transport = SMTPMailProvider(host='localhost', port=587, username='test', password='test',
+                                     from_email='sender@example.test', from_name='Test')
+        r = self.recipient()
+        def expire(*args):
+            self.now += 61
+        with patch('smtplib.SMTP') as smtp:
+            instance = smtp.return_value.__enter__.return_value
+            instance.login.side_effect = expire
+            result, reason = await control.dispatch(r, lambda token: MailMessage(
+                r['recipient_id'], r['email'], 'test', 'text', '<p>text</p>', include_logo=False),
+                transport, clock=lambda: self.now, sleep=self.sleep)
+            self.assertIsNone(result)
+            self.assertEqual(reason, 'log_heartbeat_stale')
+            instance.send_message.assert_not_called()
+        with closing(db.get_connection()) as c:
+            self.assertEqual(c.execute('SELECT COUNT(*) FROM mail_messages').fetchone()[0], 0)
+            self.assertEqual(c.execute('SELECT status FROM mail_recipients').fetchone()[0], 'pending')
+
+    async def test_window_expires_old_spam_results(self):
+        for i in range(22):
+            await self.dispatch()
+            spam = i in (0, 5, 10, 15, 21)
+            self.event(i, 'bounced' if spam else 'sent', '550 spam message rejected' if spam else '250 OK')
+            self.sync()
+        state = control.status()['providers'][0]
+        self.assertEqual((state['state'], state['spam_count']), ('active', 4))
+
+    async def test_reimport_cannot_downgrade_legacy_final(self):
+        await self.dispatch()
+        with closing(db.get_connection()) as c, c:
+            c.execute("UPDATE mail_messages SET delivery_status='delivered',observation_period=NULL")
+        self.event(0, 'deferred', '450 earlier attempt')
+        self.sync()
+        with closing(db.get_connection()) as c:
+            self.assertEqual(c.execute('SELECT delivery_status FROM mail_messages').fetchone()[0], 'delivered')
+
+    async def test_rotation_snapshot_change_and_partial_line_never_healthy(self):
+        await self.dispatch()
+        self.event(0, 'sent', '250 OK')
+        path = self.root / 'mail.log'
+        rotated = self.root / 'mail.log.1'
+        path.write_text('', encoding='utf-8')
+        rotated.write_text('\n'.join(self.lines)+'\n', encoding='utf-8')
+        original = logs.load_log_lines
+        def changing(source):
+            lines = original(source)
+            if source == rotated:
+                with rotated.open('a', encoding='utf-8') as stream:
+                    stream.write('new available line\n')
+            return lines
+        with patch.object(logs, 'load_log_lines', side_effect=changing):
+            logs.synchronize_delivery_statuses(log_path=path)
+        self.assertIsNone(control.status()['heartbeat'])
+        path.write_text('incomplete', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'Incomplete'):
+            logs.synchronize_delivery_statuses(log_path=path)
+        self.assertIsNone(control.status()['heartbeat'])
+
+    async def test_gzip_rotation_gap_and_archive_mode(self):
+        import gzip
+        await self.dispatch()
+        self.event(0, 'sent', '250 OK')
+        self.sync()
+        path = self.root / 'mail.log'
+        archived = self.root / 'mail.log.2.gz'
+        with gzip.open(archived, 'wt', encoding='utf-8') as stream:
+            stream.write(path.read_text(encoding='utf-8'))
+        path.write_text('', encoding='utf-8')
+        logs.synchronize_delivery_statuses(log_path=path)
+        self.assertIsNotNone(control.status()['heartbeat'])
+        logs.synchronize_delivery_statuses(log_path=archived, import_only=True)
+        self.assertIsNone(control.status()['heartbeat'])
+        with self.assertRaisesRegex(ValueError, 'Different live'):
+            logs.synchronize_delivery_statuses(log_path=archived)
+        archived.unlink()
+        with self.assertRaisesRegex(ValueError, 'rotation gap'):
+            logs.synchronize_delivery_statuses(log_path=path)
+        self.assertIsNone(control.status()['heartbeat'])
+
+    async def test_two_importers_and_ambiguous_queue_id_fail_closed(self):
+        path = self.root / 'mail.log'
+        with control.daily_run_lock(db.DATABASE_FILE.resolve().with_suffix('.mail-log.lock')):
+            with self.assertRaises(control.DailyRunAlreadyRunningError):
+                logs.synchronize_delivery_statuses(log_path=path)
+        await self.dispatch()
+        self.event(0, 'sent', '250 OK')
+        self.lines.insert(1, self.lines[0].replace(self.sent[0][1].provider_message_id, '<another@example.test>'))
+        path.write_text('\n'.join(self.lines)+'\n', encoding='utf-8')
+        stats = logs.synchronize_delivery_statuses(log_path=path)
+        self.assertEqual(stats['not_found'], 1)
+        self.assertIsNone(control.status()['heartbeat'])
+        with closing(db.get_connection()) as c:
+            self.assertEqual(c.execute('SELECT COUNT(*) FROM mail_delivery_events').fetchone()[0], 0)
+
+    async def test_wrong_recipient_cannot_consume_result(self):
+        await self.dispatch()
+        self.event(0)
+        self.lines[-1] = self.lines[-1].replace(self.sent[0][1].to_email, 'wrong@example.test')
+        path = self.root / 'mail.log'
+        path.write_text('\n'.join(self.lines)+'\n', encoding='utf-8')
+        logs.synchronize_delivery_statuses(log_path=path)
+        self.assertIsNone(control.status()['heartbeat'])
+        with closing(db.get_connection()) as c:
+            self.assertEqual(c.execute('SELECT COUNT(*) FROM mail_delivery_events').fetchone()[0], 0)
+
+    async def test_manual_pause_preserves_spam_evidence(self):
+        for i in range(3):
+            await self.dispatch()
+            self.event(i)
+            self.sync()
+        before = control.status()['providers'][0]
+        control.manage('pause', 'mailru')
+        after = control.status()['providers'][0]
+        self.assertEqual(before, after)
+
+    def test_baseline_migration_and_wal_backup_are_closed_and_repeatable(self):
+        import subprocess
+        import types
+        import sqlite3
+        from src.mailing.maintenance import backup_database
+        source_code = subprocess.run(['git', 'show', '853198c:src/database.py'],
+            capture_output=True, text=True, encoding='utf-8', check=True).stdout
+        legacy = types.ModuleType('legacy_database')
+        legacy.__file__ = db.__file__
+        exec(compile(source_code, '853198c:src/database.py', 'exec'), legacy.__dict__)
+        source = self.root / 'legacy.db'
+        legacy.DATABASE_FILE = source
+        legacy.initialize_database()
+        campaign = legacy.get_or_create_mail_campaign(name='legacy', selection_id=1)
+        backup = self.root / 'backup.db'
+        with closing(sqlite3.connect(source)) as writer:
+            writer.execute('PRAGMA journal_mode=WAL')
+            writer.execute('PRAGMA wal_autocheckpoint=0')
+            for n, state in enumerate(('pending', 'deferred', 'sent', 'failed'), 1):
+                writer.execute('INSERT INTO clients(id,spp_uuid,inn,name) VALUES(?,?,?,?)',
+                               (n, str(n), str(n), 'Test'))
+                writer.execute('''INSERT INTO mail_recipients(id,campaign_id,client_id,email,
+                    normalized_email,campaign_family,status) VALUES(?,?,?,?,?,'new_companies',?)''',
+                    (n, campaign, n, f'{n}@example.test', f'{n}@example.test', state))
+            writer.execute("UPDATE mail_campaigns SET next_send_at='2099-01-01 00:00:00'")
+            writer.execute("""INSERT INTO mail_messages(recipient_id,provider,provider_message_id,
+                status,tracking_token) VALUES(3,'smtp','<legacy@example.test>','sent','preserved-token')""")
+            writer.commit()
+            self.assertGreater(Path(str(source)+'-wal').stat().st_size, 0)
+            counts = backup_database(source, backup)
+            self.assertEqual(counts['mail_recipients'], 4)
+            self.assertIsNone(writer.execute("SELECT name FROM sqlite_master WHERE name='mail_control'").fetchone())
+            with self.assertRaises(FileExistsError):
+                backup_database(source, backup)
+        with closing(sqlite3.connect(backup)) as c:
+            tables = [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+            columns = {table: [r[1] for r in c.execute(f'PRAGMA table_info("{table}")')] for table in tables}
+            before = {table: c.execute(f'SELECT * FROM "{table}" ORDER BY rowid').fetchall() for table in tables}
+        with patch.object(db, 'DATABASE_FILE', backup):
+            db.initialize_database()
+            db.initialize_database()
+            self.assertEqual(control.status()['paused'], 1)
+            self.assertIsNone(control.status()['heartbeat'])
+            with closing(db.get_connection()) as c:
+                for table in tables:
+                    fields = ','.join('"'+name+'"' for name in columns[table])
+                    self.assertEqual([tuple(r) for r in c.execute(f'SELECT {fields} FROM "{table}" ORDER BY rowid')], before[table], table)
+            control.manage('resume')
+            self.heartbeat()
+            with closing(db.get_connection()) as c, c:
+                self.assertEqual(control.blocked(c, 'mailru', self.now)[0], 'legacy_feedback_pending')
+            control.manage('pause')
 
 
 if __name__ == '__main__':

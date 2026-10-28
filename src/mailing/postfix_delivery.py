@@ -32,9 +32,11 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import time
+import sqlite3
 from contextlib import closing
 from datetime import datetime
 import re
@@ -44,6 +46,8 @@ from src.database import (
     get_connection,
     initialize_database,
 )
+from src import database as db
+from src.daily_lock import daily_run_lock, DailyRunAlreadyRunningError
 
 
 DEFAULT_MAIL_LOG = Path(
@@ -116,6 +120,7 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument("--watch", action="store_true", help="Повторять проверку и heartbeat каждые 5 секунд")
+    parser.add_argument('--import-only', action='store_true', help='Импорт архива без здорового heartbeat')
     arguments = parser.parse_args()
 
     if (
@@ -143,10 +148,14 @@ def load_log_lines(
             f"Журнал Postfix не найден: {log_path}"
         )
 
-    return log_path.read_text(
-        encoding="utf-8",
-        errors="replace",
-    ).splitlines()
+    if log_path.suffix == '.gz':
+        with gzip.open(log_path, 'rt', encoding='utf-8', errors='replace') as source:
+            text = source.read()
+    else:
+        text = log_path.read_text(encoding='utf-8', errors='replace')
+    if text and not text.endswith('\n'):
+        raise ValueError('Incomplete final log line; feedback remains unhealthy')
+    return text.splitlines()
 
 
 def build_message_id_queue_map(
@@ -338,27 +347,55 @@ def event_timestamp(line: str, reference: float) -> float:
     return min(candidates, key=lambda value: abs(value-reference))
 
 
-def synchronize_delivery_statuses(*, log_path: Path, limit: int | None = None) -> dict[str, int]:
+def log_sources(log_path):
+    rotated = [p for p in log_path.parent.glob(log_path.name + '*')
+               if p.is_file() and re.fullmatch(
+                   re.escape(log_path.name) + r'(?:\.\d+|-\d{8})(?:\.gz)?', p.name)]
+    return sorted(rotated) + [log_path]
+
+
+def source_signature(sources):
+    return [(str(p), s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)
+            for p in sources for s in [p.stat()]]
+
+
+def synchronize_delivery_statuses(*, log_path: Path, limit: int | None = None,
+                                  import_only: bool = False) -> dict[str, int]:
+    # One importer per physical database, including daily_run and archive imports.
+    with daily_run_lock(db.DATABASE_FILE.resolve().with_suffix('.mail-log.lock')):
+        return _synchronize_locked(log_path=log_path.resolve(), limit=limit, import_only=import_only)
+
+
+def _synchronize_locked(*, log_path, limit, import_only):
     from src.mailing.control import evaluate, provider_for
     # Invalidate first. A partial scan/error must never advertise a healthy tail.
     with closing(get_connection()) as c, c:
         c.execute("UPDATE mail_control SET heartbeat=NULL WHERE id=1")
-    before = log_path.stat()
-    # Include the immediate rotated file to bridge rotation between polls.
-    rotated = log_path.with_name(log_path.name + ".1")
-    sources = ([rotated] if rotated.is_file() else []) + [log_path]
+        previous = c.execute('SELECT log_path,log_checkpoint FROM mail_control WHERE id=1').fetchone()
+    if not import_only and previous['log_path'] not in (None, str(log_path)):
+        raise ValueError('Different live log path; use --import-only for archives')
+    sources = [log_path] if import_only else log_sources(log_path)
+    before = source_signature(sources)
     lines = []
+    tail = None
     for source in sources:
         reference = source.stat().st_mtime
-        lines.extend((line, reference) for line in load_log_lines(source))
+        source_lines = load_log_lines(source)
+        lines.extend((line, reference) for line in source_lines)
+        if source == log_path and source_lines:
+            tail = hashlib.sha256(source_lines[-1].encode('utf-8')).hexdigest()
+    available_hashes = {hashlib.sha256(line.encode('utf-8')).hexdigest() for line, _ in lines}
+    if not import_only and previous['log_checkpoint'] and previous['log_checkpoint'] not in available_hashes:
+        raise ValueError('Log rotation gap: previous tail missing; restore retained archives before continuing')
     stats = dict(checked=0, matched_queue=0, delivered=0, bounced=0, deferred=0, not_found=0)
     with closing(get_connection()) as c, c:
         for line, reference in lines:
             match = MESSAGE_ID_RE.search(line)
             if match:
-                c.execute("INSERT OR IGNORE INTO mail_queue_ids VALUES(?,?,?)", (
+                c.execute("INSERT OR IGNORE INTO mail_queue_links VALUES(?,?,?)", (
                     match['queue_id'], match['message_id'], event_timestamp(line, reference)))
     processed = 0
+    complete = True
     deliveries = []
     for line, reference in lines:
         match = DELIVERY_RE.search(line)
@@ -369,16 +406,23 @@ def synchronize_delivery_statuses(*, log_path: Path, limit: int | None = None) -
         with closing(get_connection()) as c:
             if c.execute("SELECT 1 FROM mail_delivery_events WHERE event_key=?", (key,)).fetchone():
                 continue
-            mapping = c.execute("""SELECT provider_message_id FROM mail_queue_ids
-                WHERE queue_id=? AND event_time<=? ORDER BY event_time DESC LIMIT 1""",
-                (match['queue_id'], when)).fetchone()
-            if not mapping:
+            mappings = c.execute("""SELECT provider_message_id FROM mail_queue_links
+                WHERE queue_id=? AND event_time=(SELECT MAX(event_time) FROM mail_queue_links
+                  WHERE queue_id=? AND event_time<=?)""",
+                (match['queue_id'], match['queue_id'], when)).fetchall()
+            if len(mappings) != 1:
+                complete = False
+                stats['not_found'] += 1
                 continue
             message = c.execute("""SELECT m.*, COALESCE(m.smtp_recipient_email,r.email) AS actual_email
                 FROM mail_messages m JOIN mail_recipients r ON r.id=m.recipient_id
                 WHERE m.provider_message_id=? AND m.is_test=0 AND m.provider='smtp'
-                ORDER BY m.id DESC LIMIT 1""", (mapping[0],)).fetchone()
-        if message is None or message['actual_email'].lower() != match['recipient'].lower():
+                ORDER BY m.id DESC LIMIT 1""", (mappings[0][0],)).fetchone()
+        if message is None:
+            continue
+        if message['actual_email'].lower() != match['recipient'].lower():
+            complete = False
+            stats['not_found'] += 1
             continue
         if limit is not None and processed >= limit:
             # A deliberately limited scan cannot provide a healthy heartbeat.
@@ -404,8 +448,11 @@ def synchronize_delivery_statuses(*, log_path: Path, limit: int | None = None) -
             final = c.execute("""SELECT * FROM mail_delivery_events WHERE message_id=?
                 ORDER BY CASE WHEN status IN ('delivered','bounced') THEN 0 ELSE 1 END,
                 event_time,event_key LIMIT 1""", (message['id'],)).fetchone()
-            c.execute("UPDATE mail_messages SET delivery_status=?,result_reason=? WHERE id=?",
-                      (final['status'], final['reason'], message['id']))
+            # A legacy terminal result may only exist in the old mail_events.
+            # Never roll it back when importing an incomplete retained history.
+            c.execute("""UPDATE mail_messages SET delivery_status=?,result_reason=? WHERE id=?
+                AND (delivery_status NOT IN ('delivered','bounced') OR delivery_status=?)""",
+                      (final['status'], final['reason'], message['id'], final['status']))
             c.execute("INSERT INTO mail_events(message_id,event_type,event_data) VALUES(?,?,?)",
                       (message['id'], status, json.dumps(dict(queue_id=match['queue_id'],
                        dsn=match['dsn'], detail=detail, relay=relay[1] if relay else '',
@@ -414,10 +461,11 @@ def synchronize_delivery_statuses(*, log_path: Path, limit: int | None = None) -
         stats['checked'] += 1
         stats['matched_queue'] += 1
         stats[status] += 1
-    after = log_path.stat()
-    if (before.st_ino, before.st_size, before.st_mtime_ns) == (after.st_ino, after.st_size, after.st_mtime_ns):
+    after = source_signature([log_path] if import_only else log_sources(log_path))
+    if not import_only and complete and before == after:
         with closing(get_connection()) as c, c:
-            c.execute("UPDATE mail_control SET heartbeat=? WHERE id=1", (time.time(),))
+            c.execute("UPDATE mail_control SET heartbeat=?,log_path=?,log_checkpoint=? WHERE id=1",
+                      (time.time(), str(log_path), tail or previous['log_checkpoint']))
     return stats
 
 
@@ -429,8 +477,14 @@ def main() -> None:
     initialize_database()
 
     while True:
-        stats = synchronize_delivery_statuses(log_path=arguments.log, limit=arguments.limit)
-        print("Postfix delivery sync:", stats, flush=True)
+        try:
+            stats = synchronize_delivery_statuses(log_path=arguments.log, limit=arguments.limit,
+                                                  import_only=arguments.import_only)
+            print("Postfix delivery sync:", stats, flush=True)
+        except (OSError, ValueError, sqlite3.Error, DailyRunAlreadyRunningError) as error:
+            if not arguments.watch:
+                raise
+            print(f'Postfix feedback unhealthy: {error}', flush=True)
         if not arguments.watch:
             break
         time.sleep(5)

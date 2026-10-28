@@ -122,6 +122,10 @@ class SMTPSendResult:
     uncertain: bool = False
 
 
+class SMTPHandoffBlocked(RuntimeError):
+    """The controller stopped this message before SMTP DATA was attempted."""
+
+
 class SMTPMailProvider:
     """
     Реальный SMTP-провайдер для собственного почтового сервера.
@@ -376,6 +380,9 @@ class SMTPMailProvider:
                     self.password,
                 )
 
+                before_smtp = getattr(message, 'before_smtp', None)
+                if before_smtp is not None:
+                    before_smtp()
                 submitting = True
                 smtp.send_message(
                     email_message,

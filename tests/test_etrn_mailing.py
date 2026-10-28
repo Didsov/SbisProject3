@@ -28,6 +28,7 @@ class EtrnMailingTestCase(unittest.IsolatedAsyncioTestCase):
         self.db_patch = patch.object(database, "DATABASE_FILE", self.root / "test.db")
         self.db_patch.start()
         database.initialize_database()
+        control.manage('resume')
         import time
         self.mail_now = time.time()
         original_dispatch = control.dispatch
